@@ -11,12 +11,12 @@ clean:
 
 install:
 	sudo modprobe regmap-i2c
-	-sudo rmmod imx708
 	-sudo rmmod imx708_custom
+	-echo "10-001a" | sudo tee /sys/bus/i2c/drivers/imx708/unbind
 	sudo insmod imx708_custom.ko
 
 uninstall:
 	sudo rmmod imx708_custom
-	sudo modprobe imx708
+	-echo "10-001a" | sudo tee /sys/bus/i2c/drivers/imx708/bind
 
 reload: uninstall install
