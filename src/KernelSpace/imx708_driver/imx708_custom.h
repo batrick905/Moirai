@@ -1,8 +1,9 @@
-#ifndef IMX708_H
-#define IMX708_H
+#ifndef IMX708_CUSTOM_H
+#define IMX708_CUSTOM_H
 
 #include <linux/i2c.h>
-#include <linux/regmap.h>
+#include <linux/clk.h>
+#include <linux/regulator/consumer.h>
 #include <media/v4l2-device.h>
 #include <media/v4l2-subdev.h>
 #include <media/v4l2-ctrls.h>
@@ -55,38 +56,42 @@
 #define IMX708_PROC_NAME            "imx708_custom_stats"
 
 struct imx708_mode {
-    u32 width, height;
-    u32 line_length;
-    u32 frame_length;
-    u32 vblank_min;
-    u64 link_freq;
-    const struct reg_sequence *regs;
-    u32 num_regs;
+	u32 width, height;
+	u32 line_length;
+	u32 frame_length;
+	u32 vblank_min;
+	u64 link_freq;
+	const struct reg_sequence *regs;
+	u32 num_regs;
 };
 
 struct imx708_dev {
-    struct i2c_client           *client;
-    struct regmap               *regmap;
-    struct v4l2_subdev           sd;
-    struct media_pad             pad;
-    struct v4l2_ctrl_handler     ctrl_handler;
-    struct v4l2_mbus_framefmt    fmt;
-    struct mutex                 lock;
+	struct i2c_client           *client;
+	struct v4l2_subdev           sd;
+	struct media_pad             pad;
+	struct v4l2_ctrl_handler     ctrl_handler;
+	struct v4l2_mbus_framefmt    fmt;
+	struct mutex                 lock;
 
-    /* controls */
-    struct v4l2_ctrl            *exposure;
-    struct v4l2_ctrl            *again;
-    struct v4l2_ctrl            *dgain;
-    struct v4l2_ctrl            *vblank;
-    struct v4l2_ctrl            *hflip;
-    struct v4l2_ctrl            *vflip;
+	/* power */
+	struct regulator            *vana;
+	struct regulator            *vdig;
+	struct clk                  *xclk;
 
-    const struct imx708_mode    *cur_mode;
-    bool                         streaming;
-    u64                          frame_count;
+	/* controls */
+	struct v4l2_ctrl            *exposure;
+	struct v4l2_ctrl            *again;
+	struct v4l2_ctrl            *dgain;
+	struct v4l2_ctrl            *vblank;
+	struct v4l2_ctrl            *hflip;
+	struct v4l2_ctrl            *vflip;
 
-    /* proc */
-    struct proc_dir_entry       *proc_entry;
+	const struct imx708_mode    *cur_mode;
+	bool                         streaming;
+	u64                          frame_count;
+
+	/* proc */
+	struct proc_dir_entry       *proc_entry;
 };
 
-#endif /* IMX708_H */
+#endif /* IMX708_CUSTOM_H */
