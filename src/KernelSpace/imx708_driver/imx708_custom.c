@@ -6,12 +6,12 @@
  * Direct I2C — no regmap dependency
  */
 
-#include <linux/regmap.h>
 #include <linux/module.h>
 #include <linux/init.h>
 #include <linux/i2c.h>
 #include <linux/delay.h>
 #include <linux/clk.h>
+#include <linux/regmap.h>           /* for struct reg_sequence only */
 #include <linux/regulator/consumer.h>
 #include <linux/proc_fs.h>
 #include <linux/seq_file.h>
@@ -454,6 +454,77 @@ static const struct v4l2_subdev_ops imx708_subdev_ops = {
 };
 
 /* ════════════════════════════════════════════════════════════
+   Power helpers
+   ════════════════════════════════════════════════════════════ */
+
+static int imx708_power_on(struct imx708_dev *sensor)
+{
+	struct device *dev = &sensor->client->dev;
+	int ret;
+
+	/*
+	 * Supply names must match the DT property prefix on imx708@1a:
+	 *   "vana1"  → vana1-supply → cam1-reg  (real 2.8 V power rail)
+	 *   "vdig"   → vdig-supply  → cam-dummy-reg
+	 *   "vddl"   → vddl-supply  → cam-dummy-reg
+	 */
+	sensor->vana = devm_regulator_get(dev, "vana1");
+	sensor->vdig = devm_regulator_get(dev, "vdig");
+	sensor->vddl = devm_regulator_get(dev, "vddl");
+
+	if (!IS_ERR(sensor->vddl)) {
+		ret = regulator_enable(sensor->vddl);
+		if (ret)
+			dev_warn(dev, "vddl enable failed: %d\n", ret);
+	}
+	if (!IS_ERR(sensor->vdig)) {
+		ret = regulator_enable(sensor->vdig);
+		if (ret)
+			dev_warn(dev, "vdig enable failed: %d\n", ret);
+	}
+	if (!IS_ERR(sensor->vana)) {
+		ret = regulator_enable(sensor->vana);
+		if (ret) {
+			dev_err(dev, "vana1 enable failed: %d\n", ret);
+			return ret;
+		}
+	}
+
+	/* DT: off-on-delay = 30 ms, startup-delay = 70 ms → wait 120 ms */
+	msleep(120);
+
+	/* Enable clock */
+	sensor->xclk = devm_clk_get(dev, "inclk");
+	if (IS_ERR(sensor->xclk)) {
+		dev_warn(dev, "inclk not found, trying unnamed clock\n");
+		sensor->xclk = devm_clk_get(dev, NULL);
+	}
+	if (!IS_ERR(sensor->xclk)) {
+		clk_set_rate(sensor->xclk, 24000000);
+		ret = clk_prepare_enable(sensor->xclk);
+		if (ret)
+			dev_warn(dev, "clock enable failed: %d\n", ret);
+	}
+
+	/* Sensor needs time after clock before I2C is ready */
+	msleep(20);
+
+	return 0;
+}
+
+static void imx708_power_off(struct imx708_dev *sensor)
+{
+	if (!IS_ERR(sensor->xclk))
+		clk_disable_unprepare(sensor->xclk);
+	if (!IS_ERR(sensor->vana))
+		regulator_disable(sensor->vana);
+	if (!IS_ERR(sensor->vdig))
+		regulator_disable(sensor->vdig);
+	if (!IS_ERR(sensor->vddl))
+		regulator_disable(sensor->vddl);
+}
+
+/* ════════════════════════════════════════════════════════════
    Probe / Remove
    ════════════════════════════════════════════════════════════ */
 
@@ -473,35 +544,10 @@ static int imx708_probe(struct i2c_client *client)
 	mutex_init(&sensor->lock);
 	i2c_set_clientdata(client, sensor);
 
-	/* ── Power on: regulators ── */
-	sensor->vana = devm_regulator_get(&client->dev, "VANA");
-	sensor->vdig = devm_regulator_get(&client->dev, "VDIG");
-
-	if (!IS_ERR(sensor->vana)) {
-		ret = regulator_enable(sensor->vana);
-		if (ret)
-			dev_warn(&client->dev, "VANA enable failed: %d\n", ret);
-	}
-	if (!IS_ERR(sensor->vdig)) {
-		ret = regulator_enable(sensor->vdig);
-		if (ret)
-			dev_warn(&client->dev, "VDIG enable failed: %d\n", ret);
-	}
-
-	/* allow power rails to stabilise */
-	msleep(10);
-
-	/* ── Power on: clock ── */
-	sensor->xclk = devm_clk_get(&client->dev, NULL);
-	if (!IS_ERR(sensor->xclk)) {
-		clk_set_rate(sensor->xclk, 24000000); /* 24MHz */
-		ret = clk_prepare_enable(sensor->xclk);
-		if (ret)
-			dev_warn(&client->dev, "clock enable failed: %d\n", ret);
-	}
-
-	/* sensor needs time after clock starts before I2C is ready */
-	msleep(20);
+	/* ── Power on sensor ── */
+	ret = imx708_power_on(sensor);
+	if (ret)
+		goto err_mutex;
 
 	/* ── Verify chip identity over I2C ── */
 	ret = imx708_read_reg(sensor, IMX708_REG_CHIP_ID, &id_hi);
@@ -574,12 +620,8 @@ err_controls:
 err_entity:
 	media_entity_cleanup(&sensor->sd.entity);
 err_power:
-	if (!IS_ERR(sensor->xclk))
-		clk_disable_unprepare(sensor->xclk);
-	if (!IS_ERR(sensor->vdig))
-		regulator_disable(sensor->vdig);
-	if (!IS_ERR(sensor->vana))
-		regulator_disable(sensor->vana);
+	imx708_power_off(sensor);
+err_mutex:
 	mutex_destroy(&sensor->lock);
 	return ret;
 }
@@ -594,15 +636,9 @@ static void imx708_remove(struct i2c_client *client)
 	v4l2_async_unregister_subdev(&sensor->sd);
 	v4l2_ctrl_handler_free(&sensor->ctrl_handler);
 	media_entity_cleanup(&sensor->sd.entity);
-
-	if (!IS_ERR(sensor->xclk))
-		clk_disable_unprepare(sensor->xclk);
-	if (!IS_ERR(sensor->vdig))
-		regulator_disable(sensor->vdig);
-	if (!IS_ERR(sensor->vana))
-		regulator_disable(sensor->vana);
-
+	imx708_power_off(sensor);
 	mutex_destroy(&sensor->lock);
+
 	dev_info(&client->dev, "IMX708 custom driver removed\n");
 }
 

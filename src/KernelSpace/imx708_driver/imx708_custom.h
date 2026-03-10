@@ -73,12 +73,19 @@ struct imx708_dev {
 	struct v4l2_mbus_framefmt    fmt;
 	struct mutex                 lock;
 
-	/* power */
+	/*
+	 * Power supplies — names passed to devm_regulator_get() must match
+	 * the DT property prefix on the imx708@1a node:
+	 *   vana1-supply  → cam1-reg  (GPIO-switched 2.8 V — real sensor power)
+	 *   vdig-supply   → cam-dummy-reg
+	 *   vddl-supply   → cam-dummy-reg
+	 */
 	struct regulator            *vana;
 	struct regulator            *vdig;
+	struct regulator            *vddl;
 	struct clk                  *xclk;
 
-	/* controls */
+	/* V4L2 controls */
 	struct v4l2_ctrl            *exposure;
 	struct v4l2_ctrl            *again;
 	struct v4l2_ctrl            *dgain;
@@ -90,7 +97,7 @@ struct imx708_dev {
 	bool                         streaming;
 	u64                          frame_count;
 
-	/* proc */
+	/* /proc entry */
 	struct proc_dir_entry       *proc_entry;
 };
 
