@@ -1,0 +1,29 @@
+/dts-v1/;
+/plugin/;
+
+&i2c0 {
+    #address-cells = <1>;
+    #size-cells = <0>;
+
+    imx708: camera@1a {
+        compatible = "sony,imx708";
+        reg = <0x1a>;
+        clocks = <&clk_24mhz>;
+        clock-names = "xclk";
+        VANA-supply  = <&cam1_reg>;
+        VDIG-supply  = <&cam_dummy_reg>;
+        VDDL-supply  = <&cam_dummy_reg>;
+        rotation = <180>;
+        orientation = <2>;
+
+        port {
+            imx708_0: endpoint {
+                remote-endpoint = <&csi1_ep>;
+                clock-lanes     = <0>;
+                data-lanes      = <1 2>;
+                clock-noncontinuous;
+                link-frequencies = /bits/ 64 <450000000>;
+            };
+        };
+    };
+};
