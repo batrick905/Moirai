@@ -11,12 +11,12 @@ clean:
 
 install:
 	sudo modprobe regmap-i2c
-	sudo modprobe v4l2-common
-	sudo modprobe videobuf2-v4l2
-	sudo modprobe v4l2-async
+	-sudo rmmod imx708
+	-sudo rmmod imx708_custom
 	sudo insmod imx708_custom.ko
 
 uninstall:
 	sudo rmmod imx708_custom
+	sudo modprobe imx708
 
 reload: uninstall install
