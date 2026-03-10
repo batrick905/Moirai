@@ -6,6 +6,7 @@
  * Direct I2C — no regmap dependency
  */
 
+#include <linux/regmap.h>
 #include <linux/module.h>
 #include <linux/init.h>
 #include <linux/i2c.h>
