@@ -5,8 +5,8 @@
     #address-cells = <1>;
     #size-cells = <0>;
 
-    imx708: camera@1a {
-        compatible = "sony,imx708";
+    imx708_custom: camera@1a {
+        compatible = "sony,imx708-custom";    /* changed */
         reg = <0x1a>;
         clocks = <&clk_24mhz>;
         clock-names = "xclk";
@@ -17,7 +17,7 @@
         orientation = <2>;
 
         port {
-            imx708_0: endpoint {
+            imx708_custom_0: endpoint {       /* changed */
                 remote-endpoint = <&csi1_ep>;
                 clock-lanes     = <0>;
                 data-lanes      = <1 2>;

@@ -448,7 +448,7 @@ static int imx708_probe(struct i2c_client *client)
       if (ret) goto err_controls;
 
       /* /proc entry */
-      sensor->proc_entry = proc_create_data("imx708_stats", 0444,
+      sensor->proc_entry = proc_create_data("imx708_custom_stats", 0444,
                                                 NULL, &imx708_proc_ops,
                                                 sensor);
 
@@ -471,7 +471,7 @@ static void imx708_remove(struct i2c_client *client)
     struct imx708_dev *sensor = i2c_get_clientdata(client);
 
       if (sensor->proc_entry)
-            remove_proc_entry("imx708_stats", NULL);
+            remove_proc_entry("imx708_custom_stats", NULL);
 
       v4l2_async_unregister_subdev(&sensor->sd);
       v4l2_ctrl_handler_free(&sensor->ctrl_handler);
@@ -490,7 +490,7 @@ static const struct i2c_device_id imx708_id[] = {
 MODULE_DEVICE_TABLE(i2c, imx708_id);
 
 static const struct of_device_id imx708_of_match[] = {
-      { .compatible = "sony,imx708" },
+      { .compatible = "sony,imx708-custom" },   /* must match dts */
       { }
 };
 MODULE_DEVICE_TABLE(of, imx708_of_match);
@@ -502,11 +502,11 @@ static struct i2c_driver imx708_driver = {
       },
       .probe    = imx708_probe,
       .remove   = imx708_remove,
-    .id_table = imx708_id,
+      .id_table = imx708_id,
 };
 
 module_i2c_driver(imx708_driver);
 
 MODULE_AUTHOR("Your Name");
-MODULE_DESCRIPTION("IMX708 Camera Sensor Driver");
+MODULE_DESCRIPTION("IMX708 Custom Camera Sensor Driver");
 MODULE_LICENSE("GPL");

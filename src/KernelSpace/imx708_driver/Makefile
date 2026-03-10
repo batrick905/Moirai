@@ -1,4 +1,4 @@
-obj-m += imx708.o
+obj-m += imx708_custom.o
 
 KDIR  := /lib/modules/$(shell uname -r)/build
 PWD   := $(shell pwd)
@@ -10,9 +10,9 @@ clean:
 	$(MAKE) -C $(KDIR) M=$(PWD) clean
 
 install:
-	sudo insmod imx708.ko
+	sudo insmod imx708_custom.ko
 
 uninstall:
-	sudo rmmod imx708
+	sudo rmmod imx708_custom
 
 reload: uninstall install
