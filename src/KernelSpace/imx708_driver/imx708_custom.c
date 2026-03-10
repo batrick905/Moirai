@@ -11,7 +11,7 @@
 #include <media/v4l2-subdev.h>
 #include <media/v4l2-ctrls.h>
 #include <media/v4l2-fwnode.h>
-#include "imx708.h"
+#include "imx708_custom.h"
 
 /* ════════════════════════════════════════
       Register sequences
