@@ -17,6 +17,8 @@
 #include <media/v4l2-ctrls.h>
 #include <media/v4l2-fwnode.h>
 #include "imx708_custom.h"
+#include <linux/regulator/consumer.h>
+#include <linux/clk.h>
 
 /* ════════════════════════════════════════════════════════════
    Direct I2C helpers
@@ -34,6 +36,27 @@ static int imx708_write_reg(struct imx708_dev *sensor, u16 reg, u8 val)
         }
         return 0;
 }
+
+struct regulator *vana = devm_regulator_get(&client->dev, "VANA");
+struct regulator *vdig = devm_regulator_get(&client->dev, "VDIG");
+
+if (!IS_ERR(vana))
+    regulator_enable(vana);
+if (!IS_ERR(vdig))
+    regulator_enable(vdig);
+
+/* allow power rails to stabilise */
+msleep(10);
+
+/* get and enable clock */
+struct clk *xclk = devm_clk_get(&client->dev, NULL);
+if (!IS_ERR(xclk)) {
+    clk_set_rate(xclk, 24000000);  /* 24MHz */
+    clk_prepare_enable(xclk);
+}
+
+/* sensor needs time to come out of reset after clock starts */
+msleep(20);
 
 static int imx708_read_reg(struct imx708_dev *sensor, u16 reg, u8 *val)
 {
