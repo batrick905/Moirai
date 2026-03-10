@@ -507,6 +507,7 @@ static struct i2c_driver imx708_driver = {
 
 module_i2c_driver(imx708_driver);
 
-MODULE_AUTHOR("Your Name");
+MODULE_SOFTDEP("pre : regmap-i2c v4l2-common videobuf2-v4l2 v4l2-async");
+MODULE_AUTHOR("Patrick");
 MODULE_DESCRIPTION("IMX708 Custom Camera Sensor Driver");
 MODULE_LICENSE("GPL");
