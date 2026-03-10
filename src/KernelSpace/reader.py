@@ -1,6 +1,6 @@
 import cv2
 
-def open_device(device, width, height):
+def open_device(device: str, width:int, height:int):
     cap = cv2.VideoCapture(device)
     if not cap.isOpened():
         raise Exception("Could not open video device")
