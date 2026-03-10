@@ -374,7 +374,7 @@ static int imx708_set_fmt(struct v4l2_subdev *sd,
 }
 
 static const struct v4l2_subdev_video_ops imx708_video_ops = {
-      eam = imx708_s_stream,
+      .s_stream = imx708_s_stream,
 };
 
 static const struct v4l2_subdev_pad_ops imx708_pad_ops = {
