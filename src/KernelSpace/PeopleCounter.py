@@ -1,7 +1,7 @@
 import cv2
 
 # Replace camera capture with a static image
-img = cv2.imread("testCounter.jpeg")
+img = cv2.imread("NewCountTest.jpeg")
 
 if img is None:
     print("Error: could not load image")
