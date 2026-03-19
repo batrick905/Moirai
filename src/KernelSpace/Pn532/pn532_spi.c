@@ -34,7 +34,7 @@
 #include <linux/string.h>
 
 MODULE_LICENSE("GPL");
-MODULE_AUTHOR("You");
+MODULE_AUTHOR("Patrick");
 MODULE_DESCRIPTION("PN532 SPI NFC reader with /proc UID log");
 MODULE_VERSION("1.1");
 
