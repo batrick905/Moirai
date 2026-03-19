@@ -128,12 +128,40 @@ static struct pn532_dev *g_dev;  /* single-instance global */
 /* ── SPI helpers ─────────────────────────────────────────────────── */
 
 /*
+ * Bit-reverse a single byte.
+ * The PN532 SPI bus is LSB-first at the bit level. The BCM2835 SPI hardware
+ * is MSB-first and doesn't support SPI_LSB_FIRST. So we reverse every byte
+ * in software before sending, and reverse every received byte after reading.
+ */
+static inline u8 bitrev8(u8 b)
+{
+    b = (b & 0xF0) >> 4 | (b & 0x0F) << 4;
+    b = (b & 0xCC) >> 2 | (b & 0x33) << 2;
+    b = (b & 0xAA) >> 1 | (b & 0x55) << 1;
+    return b;
+}
+
+static void buf_to_lsb(const u8 *in, u8 *out, size_t len)
+{
+    size_t i;
+    for (i = 0; i < len; i++)
+        out[i] = bitrev8(in[i]);
+}
+
+static void buf_from_lsb(u8 *buf, size_t len)
+{
+    size_t i;
+    for (i = 0; i < len; i++)
+        buf[i] = bitrev8(buf[i]);
+}
+
+/*
  * Wait until the PN532 signals it is ready (status byte bit 0).
  * Returns 0 on success, -ETIMEDOUT if the chip doesn't respond.
  */
 static int pn532_wait_ready(struct spi_device *spi)
 {
-    u8 req = PN532_SPI_STATREAD;
+    u8 req = PN532_SPI_STATREAD;  /* already bit-reversed: 0x40 */
     u8 status = 0;
     int retries = 20;
 
@@ -148,7 +176,8 @@ static int pn532_wait_ready(struct spi_device *spi)
         spi_message_add_tail(&t[1], &m);
         spi_sync(spi, &m);
 
-        if (status == PN532_SPI_READY)
+        /* received byte is also LSB-first, reverse before comparing */
+        if (bitrev8(status) == 0x01)
             return 0;
 
         msleep(10);
@@ -162,16 +191,27 @@ static int pn532_wait_ready(struct spi_device *spi)
 static int pn532_send_frame(struct spi_device *spi,
                              const u8 *frame, size_t len)
 {
-    u8 dir = PN532_SPI_DATAWRITE;
-    struct spi_transfer t[2] = {
-        { .tx_buf = &dir,   .len = 1   },
-        { .tx_buf = frame,  .len = len },
-    };
+    /* allocate a reversed copy of the frame + direction byte */
+    u8 *tx = kmalloc(len + 1, GFP_KERNEL);
+    struct spi_transfer t = { 0 };
     struct spi_message m;
+    int ret;
+
+    if (!tx)
+        return -ENOMEM;
+
+    tx[0] = PN532_SPI_DATAWRITE;  /* already bit-reversed: 0x80 */
+    buf_to_lsb(frame, tx + 1, len);
+
+    t.tx_buf = tx;
+    t.len    = len + 1;
+
     spi_message_init(&m);
-    spi_message_add_tail(&t[0], &m);
-    spi_message_add_tail(&t[1], &m);
-    return spi_sync(spi, &m);
+    spi_message_add_tail(&t, &m);
+    ret = spi_sync(spi, &m);
+
+    kfree(tx);
+    return ret;
 }
 
 /*
@@ -181,7 +221,7 @@ static int pn532_send_frame(struct spi_device *spi,
 static int pn532_read_response(struct spi_device *spi,
                                 u8 *buf, size_t max_len)
 {
-    u8 dir = PN532_SPI_DATAREAD;
+    u8 dir = PN532_SPI_DATAREAD;  /* already bit-reversed: 0xC0 */
     struct spi_transfer t[2] = {
         { .tx_buf = &dir, .len = 1       },
         { .rx_buf = buf,  .len = max_len },
@@ -193,7 +233,12 @@ static int pn532_read_response(struct spi_device *spi,
     spi_message_add_tail(&t[0], &m);
     spi_message_add_tail(&t[1], &m);
     ret = spi_sync(spi, &m);
-    return ret < 0 ? ret : (int)max_len;
+    if (ret < 0)
+        return ret;
+
+    /* reverse all received bytes from LSB-first to MSB-first */
+    buf_from_lsb(buf, max_len);
+    return (int)max_len;
 }
 
 /* ── PN532 init: SAMConfiguration ────────────────────────────────── */
@@ -206,7 +251,7 @@ static int pn532_sam_config(struct spi_device *spi)
     ret = pn532_send_frame(spi, sam_config_frame, sizeof(sam_config_frame));
     if (ret < 0) return ret;
 
-    msleep(10);
+    msleep(100);  /* give chip time to process SAM command */
     ret = pn532_wait_ready(spi);
     if (ret < 0) return ret;
 
