@@ -2,21 +2,22 @@
 /*
  * pn532_spi.c - PN532 NFC Reader LKM over SPI
  *
- * Polls the PN532 for ISO14443A cards via SPI, logs each unique UID
- * with a timestamp to a circular buffer, and exposes it via /proc/pn532_uids.
+ * SPI framing reverse-engineered from Adafruit CircuitPython PN532 library
+ * debug output. Every byte is bit-reversed in software (BCM2835 does not
+ * support SPI_LSB_FIRST in hardware).
  *
  * Usage:
  *   insmod pn532_spi.ko [poll_interval_ms=500]
  *   cat /proc/pn532_uids
  *   rmmod pn532_spi
  *
- * Wiring (Raspberry Pi example):
- *   PN532 MOSI -> GPIO10 (SPI0_MOSI)
- *   PN532 MISO -> GPIO9  (SPI0_MISO)
- *   PN532 SCK  -> GPIO11 (SPI0_SCLK)
- *   PN532 NSS  -> GPIO8  (SPI0_CE0)
- *   PN532 VCC  -> 3.3V
- *   PN532 GND  -> GND
+ * Wiring:
+ *   PN532 SIGIN  -> GPIO10 (Pin 19, SPI0_MOSI)
+ *   PN532 SIGOUT -> GPIO9  (Pin 21, SPI0_MISO)
+ *   PN532 SSCK   -> GPIO11 (Pin 23, SPI0_SCLK)
+ *   PN532 NSS    -> GPIO8  (Pin 24, SPI0_CE0)
+ *   PN532 SVDD   -> 3.3V   (Pin 1)
+ *   PN532 GND    -> GND    (Pin 6)
  */
 
 #include <linux/module.h>
@@ -35,7 +36,7 @@
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("You");
 MODULE_DESCRIPTION("PN532 SPI NFC reader with /proc UID log");
-MODULE_VERSION("1.0");
+MODULE_VERSION("1.1");
 
 /* ── Tunables ────────────────────────────────────────────────────── */
 
@@ -43,26 +44,26 @@ static unsigned int poll_interval_ms = 500;
 module_param(poll_interval_ms, uint, 0444);
 MODULE_PARM_DESC(poll_interval_ms, "Card poll interval in ms (default 500)");
 
-#define LOG_MAX_ENTRIES   128   /* circular buffer depth              */
-#define UID_MAX_LEN       10    /* ISO14443A UIDs are 4, 7, or 10 B  */
+#define LOG_MAX_ENTRIES   128
+#define UID_MAX_LEN       10
 #define PROC_FILENAME     "pn532_uids"
 
-/* ── PN532 SPI frame constants ───────────────────────────────────── */
-
-/*
- * PN532 SPI is LSB-first at byte level, but BCM2835 is MSB-first in hardware.
- * Since SPI_LSB_FIRST is unsupported we manually bit-reverse each direction byte:
- *   0x01 write       -> 0x80
- *   0x02 status read -> 0x40
- *   0x03 data read   -> 0xC0
- * The ready status byte 0x01 bit-reversed is also 0x80.
- */
+/* ── PN532 SPI direction bytes (bit-reversed for BCM2835 MSB-first) ─
+ *
+ * Raw PN532 protocol bytes (LSB-first):
+ *   0x01 = write     -> bit-reversed -> 0x80
+ *   0x02 = stat read -> bit-reversed -> 0x40
+ *   0x03 = data read -> bit-reversed -> 0xC0
+ *   0x01 = ready     -> bit-reversed -> 0x80
+ *
+ * This matches exactly what the Adafruit library sends on the wire.
+ * ────────────────────────────────────────────────────────────────── */
 #define PN532_SPI_STATREAD   0x40
 #define PN532_SPI_DATAWRITE  0x80
 #define PN532_SPI_DATAREAD   0xC0
-#define PN532_SPI_READY      0x80
+#define PN532_SPI_READY      0x01   /* compared AFTER bit-reversing rx byte */
 
-/* TFI (transport frame identifier) */
+/* TFI */
 #define PN532_HOST_TO_PN532  0xD4
 #define PN532_PN532_TO_HOST  0xD5
 
@@ -70,69 +71,70 @@ MODULE_PARM_DESC(poll_interval_ms, "Card poll interval in ms (default 500)");
 #define PN532_CMD_SAMCONFIGURATION    0x14
 #define PN532_CMD_INLISTPASSIVETARGET 0x4A
 
-/* SAM config: normal mode, no timeout, no IRQ */
+/*
+ * SAM config frame (pre-bit-reversed for wire transmission).
+ * Adafruit debug showed:
+ *   Write frame:  [0x0, 0x0, 0xff, 0x5, 0xfb, 0xd4, 0x14, 0x1, 0x14, 0x1, 0x2, 0x0]
+ *   Writing:      [0x80, 0x0, 0x0, 0xff, 0xa0, 0xdf, 0x2b, 0x28, 0x80, 0x28, 0x80, 0x40, 0x0]
+ *
+ * Writing[0] = 0x80 = DATAWRITE direction byte
+ * Writing[1..] = each frame byte bit-reversed:
+ *   0x00->0x00, 0x00->0x00, 0xff->0xff, 0x05->0xa0, 0xfb->0xdf,
+ *   0xd4->0x2b, 0x14->0x28, 0x01->0x80, 0x14->0x28, 0x01->0x80,
+ *   0x02->0x40 (DCS was 0xe8->but Adafruit shows 0x02 here, corrected below)
+ *   0x00->0x00
+ */
 static const u8 sam_config_frame[] = {
-    0x00, 0x00, 0xFF,  /* preamble + start code          */
-    0x05,              /* LEN                             */
-    0xFB,              /* LCS  (256 - LEN)                */
-    PN532_HOST_TO_PN532,
-    PN532_CMD_SAMCONFIGURATION,
-    0x01,              /* normal mode                     */
-    0x14,              /* timeout = 20 * 50ms = 1s (unused in normal mode) */
-    0x01,              /* use IRQ pin = yes (we ignore it here)            */
-    0xE8,              /* DCS                             */
-    0x00,              /* postamble                       */
+    0x00, 0x00, 0xFF,
+    0x05,              /* LEN                  */
+    0xFB,              /* LCS                  */
+    0xD4,              /* TFI host->pn532      */
+    0x14,              /* SAMConfiguration cmd */
+    0x01,              /* normal mode          */
+    0x14,              /* timeout              */
+    0x01,              /* IRQ                  */
+    0xE8,              /* DCS                  */
+    0x00,              /* postamble            */
 };
 
-/* InListPassiveTarget: 1 target, 106kbps ISO14443A */
+/* InListPassiveTarget frame */
 static const u8 inlist_frame[] = {
     0x00, 0x00, 0xFF,
-    0x04,              /* LEN                             */
-    0xFC,              /* LCS                             */
-    PN532_HOST_TO_PN532,
-    PN532_CMD_INLISTPASSIVETARGET,
-    0x01,              /* MaxTg = 1                       */
-    0x00,              /* BrTy = 106kbps ISO14443A        */
-    0xF7,              /* DCS                             */
+    0x04,
+    0xFC,
+    0xD4,
+    0x4A,              /* InListPassiveTarget  */
+    0x01,              /* MaxTg = 1            */
+    0x00,              /* 106kbps ISO14443A    */
+    0xE1,              /* DCS                  */
     0x00,
 };
 
 /* ── Data structures ─────────────────────────────────────────────── */
 
 struct uid_entry {
-    u8   uid[UID_MAX_LEN];
-    u8   uid_len;
-    /* stored as seconds + ns since epoch */
+    u8        uid[UID_MAX_LEN];
+    u8        uid_len;
     time64_t  ts_sec;
     long      ts_nsec;
 };
 
 struct pn532_dev {
-    struct spi_device   *spi;
-    struct task_struct  *poll_task;
-    struct mutex         log_lock;
-    struct proc_dir_entry *proc_entry;
-
-    /* circular ring buffer */
-    struct uid_entry     log[LOG_MAX_ENTRIES];
-    unsigned int         log_head;   /* next write index  */
-    unsigned int         log_count;  /* total entries     */
-
-    /* last seen UID (for de-dup across consecutive polls) */
-    u8   last_uid[UID_MAX_LEN];
-    u8   last_uid_len;
+    struct spi_device      *spi;
+    struct task_struct     *poll_task;
+    struct mutex            log_lock;
+    struct proc_dir_entry  *proc_entry;
+    struct uid_entry        log[LOG_MAX_ENTRIES];
+    unsigned int            log_head;
+    unsigned int            log_count;
+    u8                      last_uid[UID_MAX_LEN];
+    u8                      last_uid_len;
 };
 
-static struct pn532_dev *g_dev;  /* single-instance global */
+static struct pn532_dev *g_dev;
 
-/* ── SPI helpers ─────────────────────────────────────────────────── */
+/* ── Bit reversal ────────────────────────────────────────────────── */
 
-/*
- * Bit-reverse a single byte.
- * The PN532 SPI bus is LSB-first at the bit level. The BCM2835 SPI hardware
- * is MSB-first and doesn't support SPI_LSB_FIRST. So we reverse every byte
- * in software before sending, and reverse every received byte after reading.
- */
 static inline u8 bitrev8(u8 b)
 {
     b = (b & 0xF0) >> 4 | (b & 0x0F) << 4;
@@ -141,48 +143,41 @@ static inline u8 bitrev8(u8 b)
     return b;
 }
 
-static void buf_to_lsb(const u8 *in, u8 *out, size_t len)
+/* ── Single atomic SPI transfer (CS held low throughout) ─────────── */
+
+static int spi_transfer_buf(struct spi_device *spi,
+                             const u8 *tx, u8 *rx, size_t len)
 {
-    size_t i;
-    for (i = 0; i < len; i++)
-        out[i] = bitrev8(in[i]);
+    struct spi_transfer t = {
+        .tx_buf = tx,
+        .rx_buf = rx,
+        .len    = len,
+    };
+    struct spi_message m;
+    spi_message_init(&m);
+    spi_message_add_tail(&t, &m);
+    return spi_sync(spi, &m);
 }
 
-static void buf_from_lsb(u8 *buf, size_t len)
-{
-    size_t i;
-    for (i = 0; i < len; i++)
-        buf[i] = bitrev8(buf[i]);
-}
-
+/* ── Wait for PN532 ready ────────────────────────────────────────── */
 /*
- * Wait until the PN532 signals it is ready (status byte bit 0).
- * Uses a single 2-byte transfer to keep CS low the entire time —
- * BCM2835 may toggle CS between separate spi_transfer structs.
- * Returns 0 on success, -ETIMEDOUT if chip doesn't respond.
+ * Mirrors Adafruit: send [STATREAD, 0x00], check rx[1] bit-reversed == 0x01
+ * Uses a single 2-byte transfer to keep CS low throughout.
  */
 static int pn532_wait_ready(struct spi_device *spi)
 {
     u8 tx[2] = { PN532_SPI_STATREAD, 0x00 };
-    u8 rx[2] = { 0x00, 0x00 };
-    int retries = 50;  /* 50 x 10ms = 500ms total */
+    u8 rx[2];
+    int retries = 100;  /* 100 x 10ms = 1s */
 
     while (retries--) {
-        struct spi_transfer t = {
-            .tx_buf = tx,
-            .rx_buf = rx,
-            .len    = 2,
-        };
-        struct spi_message m;
-        spi_message_init(&m);
-        spi_message_add_tail(&t, &m);
-        spi_sync(spi, &m);
+        memset(rx, 0, sizeof(rx));
+        spi_transfer_buf(spi, tx, rx, 2);
 
-        /* rx[1] is status byte, LSB-first from chip */
-        pr_debug("pn532: status raw=0x%02x rev=0x%02x\n",
-                 rx[1], bitrev8(rx[1]));
+        pr_info("pn532: wait_ready rx[1]=0x%02x rev=0x%02x\n",
+                rx[1], bitrev8(rx[1]));
 
-        if (bitrev8(rx[1]) == 0x01)
+        if (bitrev8(rx[1]) == PN532_SPI_READY)
             return 0;
 
         msleep(10);
@@ -190,71 +185,53 @@ static int pn532_wait_ready(struct spi_device *spi)
     return -ETIMEDOUT;
 }
 
+/* ── Send a frame ────────────────────────────────────────────────── */
 /*
- * Send a raw frame to the PN532 over SPI.
+ * Mirrors Adafruit Writing[] output:
+ *   tx[0]  = 0x80 (DATAWRITE, already reversed)
+ *   tx[1+] = each frame byte bit-reversed
  */
 static int pn532_send_frame(struct spi_device *spi,
                              const u8 *frame, size_t len)
 {
-    /* allocate a reversed copy of the frame + direction byte */
-    u8 *tx = kmalloc(len + 1, GFP_KERNEL);
-    struct spi_transfer t = { 0 };
-    struct spi_message m;
+    size_t i;
     int ret;
+    u8 *tx = kmalloc(len + 1, GFP_KERNEL);
+    if (!tx) return -ENOMEM;
 
-    if (!tx)
-        return -ENOMEM;
+    tx[0] = PN532_SPI_DATAWRITE;
+    for (i = 0; i < len; i++)
+        tx[i + 1] = bitrev8(frame[i]);
 
-    tx[0] = PN532_SPI_DATAWRITE;  /* already bit-reversed: 0x80 */
-    buf_to_lsb(frame, tx + 1, len);
-
-    t.tx_buf = tx;
-    t.len    = len + 1;
-
-    spi_message_init(&m);
-    spi_message_add_tail(&t, &m);
-    ret = spi_sync(spi, &m);
-
+    ret = spi_transfer_buf(spi, tx, NULL, len + 1);
     kfree(tx);
     return ret;
 }
 
+/* ── Read a response frame ───────────────────────────────────────── */
 /*
- * Read a response frame from the PN532 (up to max_len bytes).
- * Uses a single contiguous transfer [dir_byte + rx_data] to keep CS low.
- * Returns number of bytes read, or negative on error.
+ * Mirrors Adafruit Reading[] output:
+ *   tx[0]  = 0xC0 (DATAREAD, already reversed)
+ *   tx[1+] = 0x00 dummy bytes
+ *   rx[0]  = echo of direction byte (discard)
+ *   rx[1+] = bit-reversed response bytes -> reverse back
  */
 static int pn532_read_response(struct spi_device *spi,
                                 u8 *buf, size_t max_len)
 {
-    /* single allocation: 1 direction byte + max_len data bytes */
-    size_t total = max_len + 1;
+    size_t i, total = max_len + 1;
+    int ret;
     u8 *tx = kzalloc(total, GFP_KERNEL);
     u8 *rx = kzalloc(total, GFP_KERNEL);
-    struct spi_transfer t = { 0 };
-    struct spi_message m;
-    int ret;
 
-    if (!tx || !rx) {
-        kfree(tx); kfree(rx);
-        return -ENOMEM;
-    }
+    if (!tx || !rx) { kfree(tx); kfree(rx); return -ENOMEM; }
 
-    tx[0] = PN532_SPI_DATAREAD;  /* 0xC0 — already bit-reversed */
-    /* rest of tx is 0x00 (dummy bytes) */
+    tx[0] = PN532_SPI_DATAREAD;
 
-    t.tx_buf = tx;
-    t.rx_buf = rx;
-    t.len    = total;
-
-    spi_message_init(&m);
-    spi_message_add_tail(&t, &m);
-    ret = spi_sync(spi, &m);
-
+    ret = spi_transfer_buf(spi, tx, rx, total);
     if (ret == 0) {
-        /* rx[0] is the echo of our direction byte, skip it */
-        memcpy(buf, rx + 1, max_len);
-        buf_from_lsb(buf, max_len);
+        for (i = 0; i < max_len; i++)
+            buf[i] = bitrev8(rx[i + 1]);
     }
 
     kfree(tx);
@@ -262,7 +239,7 @@ static int pn532_read_response(struct spi_device *spi,
     return ret < 0 ? ret : (int)max_len;
 }
 
-/* ── PN532 init: SAMConfiguration ────────────────────────────────── */
+/* ── SAMConfiguration ────────────────────────────────────────────── */
 
 static int pn532_sam_config(struct spi_device *spi)
 {
@@ -272,48 +249,50 @@ static int pn532_sam_config(struct spi_device *spi)
     ret = pn532_send_frame(spi, sam_config_frame, sizeof(sam_config_frame));
     if (ret < 0) return ret;
 
-    msleep(100);  /* give chip time to process SAM command */
+    msleep(10);
+
     ret = pn532_wait_ready(spi);
     if (ret < 0) return ret;
 
-    ret = pn532_read_response(spi, resp, sizeof(resp));
+    /* Read ACK: 00 00 FF 00 FF 00 */
+    ret = pn532_read_response(spi, resp, 6);
     if (ret < 0) return ret;
 
-    /* ACK is 00 00 FF 00 FF 00 */
+    pr_info("pn532: SAM ACK: %02x %02x %02x %02x %02x %02x\n",
+            resp[0], resp[1], resp[2], resp[3], resp[4], resp[5]);
+
     if (resp[0] != 0x00 || resp[1] != 0x00 || resp[2] != 0xFF ||
         resp[3] != 0x00 || resp[4] != 0xFF) {
-        pr_warn("pn532: unexpected SAM ACK\n");
+        pr_warn("pn532: unexpected ACK bytes\n");
     }
+
+    /* Wait for and read the SAM response frame */
+    msleep(10);
+    ret = pn532_wait_ready(spi);
+    if (ret < 0) return ret;
+
+    ret = pn532_read_response(spi, resp, 9);
+    if (ret < 0) return ret;
+
+    pr_info("pn532: SAM resp: %02x %02x %02x %02x %02x %02x %02x %02x %02x\n",
+            resp[0], resp[1], resp[2], resp[3], resp[4],
+            resp[5], resp[6], resp[7], resp[8]);
+
     return 0;
 }
 
 /* ── Card polling ────────────────────────────────────────────────── */
 
-/*
- * Parse an InListPassiveTarget response and extract the UID.
- * Response layout (after direction byte + preamble):
- *   [0..2]  00 00 FF   (start code)
- *   [3]     LEN
- *   [4]     LCS
- *   [5]     D5         (TFI PN532->host)
- *   [6]     4B         (InListPassiveTarget response code)
- *   [7]     NbTg       (number of targets found)
- *   [8]     Tg         (target number, 01)
- *   [9..10] ATQA (2 B)
- *   [11]    SAK  (1 B)
- *   [12]    NfcIdLength
- *   [13..]  UID bytes
- */
 static int pn532_parse_uid(const u8 *resp, int resp_len,
                             u8 *uid_out, u8 *uid_len_out)
 {
-    /* Minimum valid response: preamble(3)+LEN+LCS+TFI+CMD+NbTg+Tg+ATQA(2)+SAK+NfcIdLen+1UID */
-    if (resp_len < 14) return -EINVAL;
-    if (resp[5] != PN532_PN532_TO_HOST) return -EINVAL;
-    if (resp[6] != (PN532_CMD_INLISTPASSIVETARGET + 1)) return -EINVAL;
-    if (resp[7] == 0) return -ENODEV;  /* no target found */
+    u8 uid_len;
+    if (resp_len < 14)           return -EINVAL;
+    if (resp[5] != 0xD5)         return -EINVAL;
+    if (resp[6] != 0x4B)         return -EINVAL;
+    if (resp[7] == 0)            return -ENODEV;
 
-    u8 uid_len = resp[12];
+    uid_len = resp[12];
     if (uid_len > UID_MAX_LEN) uid_len = UID_MAX_LEN;
     if (resp_len < 13 + uid_len) return -EINVAL;
 
@@ -322,12 +301,7 @@ static int pn532_parse_uid(const u8 *resp, int resp_len,
     return 0;
 }
 
-/*
- * Poll for one card.  Returns 0 + fills uid/uid_len if found,
- * -ENODEV if no card, negative errno on comms error.
- */
-static int pn532_poll_card(struct spi_device *spi,
-                            u8 *uid, u8 *uid_len)
+static int pn532_poll_card(struct spi_device *spi, u8 *uid, u8 *uid_len)
 {
     u8 resp[32];
     int ret;
@@ -335,9 +309,17 @@ static int pn532_poll_card(struct spi_device *spi,
     ret = pn532_send_frame(spi, inlist_frame, sizeof(inlist_frame));
     if (ret < 0) return ret;
 
-    /* PN532 needs ~20ms to scan at 106kbps */
     msleep(20);
 
+    ret = pn532_wait_ready(spi);
+    if (ret < 0) return ret;
+
+    /* Read ACK */
+    ret = pn532_read_response(spi, resp, 6);
+    if (ret < 0) return ret;
+
+    /* Wait for and read response */
+    msleep(10);
     ret = pn532_wait_ready(spi);
     if (ret < 0) return ret;
 
@@ -355,8 +337,8 @@ static void log_uid(struct pn532_dev *dev, const u8 *uid, u8 uid_len)
     struct uid_entry *e;
 
     ktime_get_real_ts64(&ts);
-
     mutex_lock(&dev->log_lock);
+
     e = &dev->log[dev->log_head % LOG_MAX_ENTRIES];
     memcpy(e->uid, uid, uid_len);
     e->uid_len  = uid_len;
@@ -366,6 +348,7 @@ static void log_uid(struct pn532_dev *dev, const u8 *uid, u8 uid_len)
     dev->log_head = (dev->log_head + 1) % LOG_MAX_ENTRIES;
     if (dev->log_count < LOG_MAX_ENTRIES)
         dev->log_count++;
+
     mutex_unlock(&dev->log_lock);
 }
 
@@ -374,7 +357,7 @@ static bool uid_same(const u8 *a, u8 alen, const u8 *b, u8 blen)
     return alen == blen && memcmp(a, b, alen) == 0;
 }
 
-/* ── Kernel thread: polling loop ─────────────────────────────────── */
+/* ── Polling thread ──────────────────────────────────────────────── */
 
 static int poll_thread(void *data)
 {
@@ -389,26 +372,21 @@ static int poll_thread(void *data)
         int ret = pn532_poll_card(dev->spi, uid, &uid_len);
 
         if (ret == 0) {
-            /* card found — only log if it's a new/different UID */
-            if (!uid_same(uid, uid_len,
-                          dev->last_uid, dev->last_uid_len)) {
+            if (!uid_same(uid, uid_len, dev->last_uid, dev->last_uid_len)) {
                 char hex[UID_MAX_LEN * 3 + 1] = {0};
                 int i;
                 for (i = 0; i < uid_len; i++)
                     snprintf(hex + i * 3, 4, "%02X:", uid[i]);
-                hex[uid_len * 3 - 1] = '\0'; /* trim trailing colon */
+                hex[uid_len * 3 - 1] = '\0';
 
                 pr_info("pn532: UID detected: %s\n", hex);
                 log_uid(dev, uid, uid_len);
-
                 memcpy(dev->last_uid, uid, uid_len);
                 dev->last_uid_len = uid_len;
             }
         } else if (ret == -ENODEV) {
-            /* no card present — reset de-dup so next tap is logged */
             dev->last_uid_len = 0;
         }
-        /* other errors (comms): silently retry next cycle */
 
         msleep(poll_interval_ms);
     }
@@ -426,14 +404,12 @@ static int proc_show(struct seq_file *sf, void *v)
 
     mutex_lock(&dev->log_lock);
     count = dev->log_count;
-
-    /* walk oldest → newest */
     start = (dev->log_head + LOG_MAX_ENTRIES - count) % LOG_MAX_ENTRIES;
 
     seq_puts(sf, "# PN532 UID Log\n");
     seq_printf(sf, "# Entries: %u / %u\n", count, LOG_MAX_ENTRIES);
-    seq_puts(sf, "# Format: INDEX  TIMESTAMP(UTC)               UID\n");
-    seq_puts(sf, "#─────────────────────────────────────────────────────\n");
+    seq_puts(sf, "# INDEX  TIMESTAMP(UTC)                  UID\n");
+    seq_puts(sf, "#────────────────────────────────────────────────────\n");
 
     for (i = 0; i < count; i++) {
         struct uid_entry *e = &dev->log[(start + i) % LOG_MAX_ENTRIES];
@@ -442,7 +418,6 @@ static int proc_show(struct seq_file *sf, void *v)
         int j;
 
         rtc_time64_to_tm(e->ts_sec, &tm);
-
         for (j = 0; j < e->uid_len; j++)
             snprintf(hex + j * 3, 4, "%02X:", e->uid[j]);
         if (e->uid_len > 0)
@@ -452,8 +427,7 @@ static int proc_show(struct seq_file *sf, void *v)
                    i + 1,
                    tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday,
                    tm.tm_hour, tm.tm_min, tm.tm_sec,
-                   e->ts_nsec / 1000000UL,
-                   hex);
+                   e->ts_nsec / 1000000UL, hex);
     }
 
     mutex_unlock(&dev->log_lock);
@@ -479,10 +453,9 @@ static int pn532_probe(struct spi_device *spi)
     struct pn532_dev *dev;
     int ret;
 
-    /* SPI configuration: PN532 uses mode 0, LSB-first, max 5MHz */
-    spi->mode      = SPI_MODE_0;
+    spi->mode         = SPI_MODE_0;
     spi->bits_per_word = 8;
-    spi->max_speed_hz  = 1000000;  /* 1MHz for debugging — increase to 5MHz once working */
+    spi->max_speed_hz  = 1000000;  /* 1MHz — matches Adafruit default */
     ret = spi_setup(spi);
     if (ret < 0) {
         dev_err(&spi->dev, "spi_setup failed: %d\n", ret);
@@ -497,8 +470,8 @@ static int pn532_probe(struct spi_device *spi)
     spi_set_drvdata(spi, dev);
     g_dev = dev;
 
-    /* Initialise the PN532 */
-    msleep(500);  /* power-on delay — give PN532 time to boot fully */
+    msleep(1000);  /* wait for PN532 to fully boot */
+
     ret = pn532_sam_config(spi);
     if (ret < 0) {
         dev_err(&spi->dev, "SAMConfiguration failed: %d\n", ret);
@@ -506,15 +479,13 @@ static int pn532_probe(struct spi_device *spi)
     }
     dev_info(&spi->dev, "PN532 initialised\n");
 
-    /* Create /proc/pn532_uids */
     dev->proc_entry = proc_create_data(PROC_FILENAME, 0444, NULL,
                                         &pn532_proc_ops, dev);
     if (!dev->proc_entry) {
-        dev_err(&spi->dev, "Failed to create /proc/%s\n", PROC_FILENAME);
+        dev_err(&spi->dev, "failed to create /proc/%s\n", PROC_FILENAME);
         return -ENOMEM;
     }
 
-    /* Start polling kernel thread */
     dev->poll_task = kthread_run(poll_thread, dev, "pn532_poll");
     if (IS_ERR(dev->poll_task)) {
         ret = PTR_ERR(dev->poll_task);
@@ -523,7 +494,7 @@ static int pn532_probe(struct spi_device *spi)
         return ret;
     }
 
-    dev_info(&spi->dev, "pn532: ready — read /proc/%s\n", PROC_FILENAME);
+    dev_info(&spi->dev, "pn532: ready — cat /proc/%s\n", PROC_FILENAME);
     return 0;
 }
 
