@@ -1,4 +1,8 @@
 import tkinter as tk
+import sys
+sys.path.append("/home/artursiuda/Moirai/src/KernelSpace")
+import NFC_daemon
+import threading
 from tkinter.scrolledtext import ScrolledText
 import tkinter.simpledialog as simpledialog
 import os
@@ -47,8 +51,8 @@ class App(tk.Tk):
 		self.after(1000, self.refresh_log) # checks every second
 
 	def start_daemon(self):
-		t = threading.Thread(targer = nfc_daemon.main, args(self.register_uid,), daemon=True)
-		t.start
+		t = threading.Thread(target=NFC_daemon.main, args=(self.register_uid,), daemon=True)
+		t.start()
 
 if __name__ == "__main__":
 	app = App()
