@@ -49,11 +49,18 @@ MODULE_PARM_DESC(poll_interval_ms, "Card poll interval in ms (default 500)");
 
 /* ── PN532 SPI frame constants ───────────────────────────────────── */
 
-/* PN532 SPI uses LSB-first and a data-direction byte */
-#define PN532_SPI_STATREAD   0x02
-#define PN532_SPI_DATAWRITE  0x01
-#define PN532_SPI_DATAREAD   0x03
-#define PN532_SPI_READY      0x01
+/*
+ * PN532 SPI is LSB-first at byte level, but BCM2835 is MSB-first in hardware.
+ * Since SPI_LSB_FIRST is unsupported we manually bit-reverse each direction byte:
+ *   0x01 write       -> 0x80
+ *   0x02 status read -> 0x40
+ *   0x03 data read   -> 0xC0
+ * The ready status byte 0x01 bit-reversed is also 0x80.
+ */
+#define PN532_SPI_STATREAD   0x40
+#define PN532_SPI_DATAWRITE  0x80
+#define PN532_SPI_DATAREAD   0xC0
+#define PN532_SPI_READY      0x80
 
 /* TFI (transport frame identifier) */
 #define PN532_HOST_TO_PN532  0xD4
