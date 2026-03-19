@@ -407,7 +407,7 @@ static int pn532_probe(struct spi_device *spi)
     int ret;
 
     /* SPI configuration: PN532 uses mode 0, LSB-first, max 5MHz */
-    spi->mode      = SPI_MODE_0 | SPI_LSB_FIRST;
+    spi->mode      = SPI_MODE_0;
     spi->bits_per_word = 8;
     spi->max_speed_hz  = 5000000;
     ret = spi_setup(spi);
@@ -477,7 +477,7 @@ static const struct spi_device_id pn532_spi_id[] = {
     { }
 };
 MODULE_DEVICE_TABLE(spi, pn532_spi_id);
-//
+
 static const struct of_device_id pn532_of_match[] = {
     { .compatible = "nxp,pn532" },
     { }
