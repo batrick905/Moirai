@@ -137,7 +137,7 @@ def main():
                 print(f"[TAP] {name} ({uid}) at {timestamp}")
                 log_tap(uid, name, timestamp)
             else:
-                db   = register_uid(uid, db)
+                db   = GUI.register_uid(uid, db)
                 name = db.get(uid, "UNKNOWN")
                 log_tap(uid, name, timestamp)
                 print("\n  Waiting for card taps...\n")
