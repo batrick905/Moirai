@@ -246,28 +246,26 @@ static int pn532_sam_config(struct spi_device *spi)
     u8 resp[16];
     int ret;
 
+    /*
+     * Adafruit sequence (from debug output):
+     *   1. Send frame
+     *   2. Read ACK immediately (no wait_ready before ACK)
+     *   3. wait_ready
+     *   4. Read response frame
+     */
     ret = pn532_send_frame(spi, sam_config_frame, sizeof(sam_config_frame));
     if (ret < 0) return ret;
 
     msleep(10);
 
-    ret = pn532_wait_ready(spi);
-    if (ret < 0) return ret;
-
-    /* Read ACK: 00 00 FF 00 FF 00 */
+    /* Read ACK immediately — do NOT wait_ready first */
     ret = pn532_read_response(spi, resp, 6);
     if (ret < 0) return ret;
 
     pr_info("pn532: SAM ACK: %02x %02x %02x %02x %02x %02x\n",
             resp[0], resp[1], resp[2], resp[3], resp[4], resp[5]);
 
-    if (resp[0] != 0x00 || resp[1] != 0x00 || resp[2] != 0xFF ||
-        resp[3] != 0x00 || resp[4] != 0xFF) {
-        pr_warn("pn532: unexpected ACK bytes\n");
-    }
-
-    /* Wait for and read the SAM response frame */
-    msleep(10);
+    /* NOW wait for chip to be ready with response frame */
     ret = pn532_wait_ready(spi);
     if (ret < 0) return ret;
 
@@ -311,15 +309,11 @@ static int pn532_poll_card(struct spi_device *spi, u8 *uid, u8 *uid_len)
 
     msleep(20);
 
-    ret = pn532_wait_ready(spi);
-    if (ret < 0) return ret;
-
-    /* Read ACK */
+    /* Read ACK immediately after send — no wait_ready before ACK */
     ret = pn532_read_response(spi, resp, 6);
     if (ret < 0) return ret;
 
-    /* Wait for and read response */
-    msleep(10);
+    /* Now wait for card scan result */
     ret = pn532_wait_ready(spi);
     if (ret < 0) return ret;
 
