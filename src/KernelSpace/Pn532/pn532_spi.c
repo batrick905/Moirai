@@ -157,27 +157,32 @@ static void buf_from_lsb(u8 *buf, size_t len)
 
 /*
  * Wait until the PN532 signals it is ready (status byte bit 0).
- * Returns 0 on success, -ETIMEDOUT if the chip doesn't respond.
+ * Uses a single 2-byte transfer to keep CS low the entire time —
+ * BCM2835 may toggle CS between separate spi_transfer structs.
+ * Returns 0 on success, -ETIMEDOUT if chip doesn't respond.
  */
 static int pn532_wait_ready(struct spi_device *spi)
 {
-    u8 req = PN532_SPI_STATREAD;  /* already bit-reversed: 0x40 */
-    u8 status = 0;
-    int retries = 20;
+    u8 tx[2] = { PN532_SPI_STATREAD, 0x00 };
+    u8 rx[2] = { 0x00, 0x00 };
+    int retries = 50;  /* 50 x 10ms = 500ms total */
 
     while (retries--) {
-        struct spi_transfer t[2] = {
-            { .tx_buf = &req,    .len = 1 },
-            { .rx_buf = &status, .len = 1 },
+        struct spi_transfer t = {
+            .tx_buf = tx,
+            .rx_buf = rx,
+            .len    = 2,
         };
         struct spi_message m;
         spi_message_init(&m);
-        spi_message_add_tail(&t[0], &m);
-        spi_message_add_tail(&t[1], &m);
+        spi_message_add_tail(&t, &m);
         spi_sync(spi, &m);
 
-        /* received byte is also LSB-first, reverse before comparing */
-        if (bitrev8(status) == 0x01)
+        /* rx[1] is status byte, LSB-first from chip */
+        pr_debug("pn532: status raw=0x%02x rev=0x%02x\n",
+                 rx[1], bitrev8(rx[1]));
+
+        if (bitrev8(rx[1]) == 0x01)
             return 0;
 
         msleep(10);
@@ -216,29 +221,45 @@ static int pn532_send_frame(struct spi_device *spi,
 
 /*
  * Read a response frame from the PN532 (up to max_len bytes).
+ * Uses a single contiguous transfer [dir_byte + rx_data] to keep CS low.
  * Returns number of bytes read, or negative on error.
  */
 static int pn532_read_response(struct spi_device *spi,
                                 u8 *buf, size_t max_len)
 {
-    u8 dir = PN532_SPI_DATAREAD;  /* already bit-reversed: 0xC0 */
-    struct spi_transfer t[2] = {
-        { .tx_buf = &dir, .len = 1       },
-        { .rx_buf = buf,  .len = max_len },
-    };
+    /* single allocation: 1 direction byte + max_len data bytes */
+    size_t total = max_len + 1;
+    u8 *tx = kzalloc(total, GFP_KERNEL);
+    u8 *rx = kzalloc(total, GFP_KERNEL);
+    struct spi_transfer t = { 0 };
     struct spi_message m;
     int ret;
 
-    spi_message_init(&m);
-    spi_message_add_tail(&t[0], &m);
-    spi_message_add_tail(&t[1], &m);
-    ret = spi_sync(spi, &m);
-    if (ret < 0)
-        return ret;
+    if (!tx || !rx) {
+        kfree(tx); kfree(rx);
+        return -ENOMEM;
+    }
 
-    /* reverse all received bytes from LSB-first to MSB-first */
-    buf_from_lsb(buf, max_len);
-    return (int)max_len;
+    tx[0] = PN532_SPI_DATAREAD;  /* 0xC0 — already bit-reversed */
+    /* rest of tx is 0x00 (dummy bytes) */
+
+    t.tx_buf = tx;
+    t.rx_buf = rx;
+    t.len    = total;
+
+    spi_message_init(&m);
+    spi_message_add_tail(&t, &m);
+    ret = spi_sync(spi, &m);
+
+    if (ret == 0) {
+        /* rx[0] is the echo of our direction byte, skip it */
+        memcpy(buf, rx + 1, max_len);
+        buf_from_lsb(buf, max_len);
+    }
+
+    kfree(tx);
+    kfree(rx);
+    return ret < 0 ? ret : (int)max_len;
 }
 
 /* ── PN532 init: SAMConfiguration ────────────────────────────────── */
@@ -461,7 +482,7 @@ static int pn532_probe(struct spi_device *spi)
     /* SPI configuration: PN532 uses mode 0, LSB-first, max 5MHz */
     spi->mode      = SPI_MODE_0;
     spi->bits_per_word = 8;
-    spi->max_speed_hz  = 5000000;
+    spi->max_speed_hz  = 1000000;  /* 1MHz for debugging — increase to 5MHz once working */
     ret = spi_setup(spi);
     if (ret < 0) {
         dev_err(&spi->dev, "spi_setup failed: %d\n", ret);
@@ -477,7 +498,7 @@ static int pn532_probe(struct spi_device *spi)
     g_dev = dev;
 
     /* Initialise the PN532 */
-    msleep(100);  /* power-on delay */
+    msleep(500);  /* power-on delay — give PN532 time to boot fully */
     ret = pn532_sam_config(spi);
     if (ret < 0) {
         dev_err(&spi->dev, "SAMConfiguration failed: %d\n", ret);
