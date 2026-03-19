@@ -1,20 +1,8 @@
 /*
  * servo_driver.c - Linux Kernel Module for Micro Servo on Raspberry Pi 4
- *
- * Uses the kernel PWM framework (pwm_bcm2835 / pwmchip0) instead of
- * direct register access — required on kernel 6.x where peripheral
- * physical addresses are protected and ioremap of raw BCM2711 addresses
- * causes a NULL-deref oops.
+ * Version 3 — kernel 6.12 compatible (pwm_request_from_chip + pwm_put)
  *
  * Requires: dtoverlay=pwm,pin=18,func=2 in /boot/firmware/config.txt
- *
- * Device:   /dev/servo
- * Commands (write):
- *   "90"                    → move to 90°
- *   "sweep 0 180 5 20"      → sweep start end step delay_ms
- * Read:     blocks until angle changes, returns current angle
- * ioctl:    SERVO_IOCTL_SET_ANGLE / GET_ANGLE / CENTER / SWEEP
- * proc:     /proc/servo_stats
  */
 
 #include <linux/module.h>
@@ -31,16 +19,17 @@
 #include <linux/proc_fs.h>
 #include <linux/seq_file.h>
 #include <linux/pwm.h>
+#include <linux/platform_device.h>
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("OS Project Team");
 MODULE_DESCRIPTION("Micro Servo Driver for Raspberry Pi 4 via Kernel PWM API");
-MODULE_VERSION("2.0");
+MODULE_VERSION("3.0");
 
 /* ── Servo PWM parameters ────────────────────────────────────────────── */
-#define PWM_PERIOD_NS       20000000u   /* 20ms  = 50Hz                  */
-#define SERVO_MIN_NS         1000000u   /* 1ms   = 0°                    */
-#define SERVO_MAX_NS         2000000u   /* 2ms   = 180°                  */
+#define PWM_PERIOD_NS       20000000u
+#define SERVO_MIN_NS         1000000u
+#define SERVO_MAX_NS         2000000u
 #define SERVO_MIN_ANGLE      0
 #define SERVO_MAX_ANGLE      180
 
@@ -59,10 +48,10 @@ struct servo_sweep_cmd {
 };
 
 /* ── Module state ────────────────────────────────────────────────────── */
-static dev_t            servo_dev;
-static struct cdev      servo_cdev;
-static struct class    *servo_class;
-static struct device   *servo_device;
+static dev_t             servo_dev;
+static struct cdev       servo_cdev;
+static struct class     *servo_class;
+static struct device    *servo_device;
 static struct pwm_device *servo_pwm;
 
 static DEFINE_MUTEX(servo_mutex);
@@ -89,34 +78,28 @@ static unsigned int angle_to_ns(int angle)
 static int pwm_apply_angle(int angle)
 {
     struct pwm_state state;
-
     pwm_get_state(servo_pwm, &state);
     state.period     = PWM_PERIOD_NS;
     state.duty_cycle = angle_to_ns(angle);
     state.enabled    = true;
     state.polarity   = PWM_POLARITY_NORMAL;
-
     return pwm_apply_might_sleep(servo_pwm, &state);
 }
 
-/* Must be called with servo_mutex held */
 static int servo_set_angle_locked(int angle)
 {
     int ret;
-
     if (angle < SERVO_MIN_ANGLE || angle > SERVO_MAX_ANGLE) {
-        pr_warn("servo_driver: angle %d out of range\n", angle);
+        pr_warn("servo_driver: angle %d out of range [0,180]\n", angle);
         error_count++;
         return -EINVAL;
     }
-
     ret = pwm_apply_angle(angle);
     if (ret) {
-        pr_err("servo_driver: pwm_apply_might_sleep failed (%d)\n", ret);
+        pr_err("servo_driver: pwm_apply failed (%d)\n", ret);
         error_count++;
         return ret;
     }
-
     current_angle = angle;
     angle_changed = 1;
     wake_up_interruptible(&servo_wq);
@@ -136,10 +119,6 @@ static int servo_release(struct inode *inode, struct file *file)
     return 0;
 }
 
-/*
- * read() — blocks until the angle changes, then returns it.
- * Demonstrates blocking read with a wait queue.
- */
 static ssize_t servo_read(struct file *file, char __user *buf,
                            size_t count, loff_t *ppos)
 {
@@ -159,7 +138,6 @@ static ssize_t servo_read(struct file *file, char __user *buf,
 
     if ((size_t)len > count)
         return -EINVAL;
-
     if (copy_to_user(buf, msg, len))
         return -EFAULT;
 
@@ -168,21 +146,12 @@ static ssize_t servo_read(struct file *file, char __user *buf,
     return len;
 }
 
-/*
- * write() — accepts:
- *   "<angle>"
- *   "sweep <start> <end> <step> [delay_ms]"
- *
- * A sweep blocks for its full duration (mutex held across steps).
- * A second process writing concurrently will block on the mutex.
- */
 static ssize_t servo_write(struct file *file, const char __user *buf,
                             size_t count, loff_t *ppos)
 {
     char  kbuf[64];
     size_t len = min(count, sizeof(kbuf) - 1);
-    int   angle, start, end, step, delay_ms = 20;
-    int   ret = 0;
+    int   angle, start, end, step, delay_ms = 20, ret = 0;
 
     if (copy_from_user(kbuf, buf, len))
         return -EFAULT;
@@ -195,12 +164,9 @@ static ssize_t servo_write(struct file *file, const char __user *buf,
 
     if (sscanf(kbuf, "sweep %d %d %d %d", &start, &end, &step, &delay_ms) >= 3) {
         int a;
-        if (step <= 0) step = 1;
+        if (step    <= 0) step    = 1;
         if (delay_ms <= 0) delay_ms = 20;
         total_sweeps++;
-        pr_info("servo_driver: sweep %d->%d step=%d delay=%dms\n",
-                start, end, step, delay_ms);
-
         if (start <= end) {
             for (a = start; a <= end && ret == 0; a += step) {
                 ret = servo_set_angle_locked(a);
@@ -219,11 +185,9 @@ static ssize_t servo_write(struct file *file, const char __user *buf,
             }
         }
     } else if (sscanf(kbuf, "%d", &angle) == 1) {
-        pr_info("servo_driver: set angle %d°\n", angle);
         ret = servo_set_angle_locked(angle);
         if (ret == 0) total_writes++;
     } else {
-        pr_warn("servo_driver: unknown command '%s'\n", kbuf);
         error_count++;
         ret = -EINVAL;
     }
@@ -247,19 +211,16 @@ static long servo_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
         ret = servo_set_angle_locked(angle);
         if (!ret) total_writes++;
         break;
-
     case SERVO_IOCTL_GET_ANGLE:
         angle = current_angle;
         if (copy_to_user((int __user *)arg, &angle, sizeof(int)))
             ret = -EFAULT;
         total_reads++;
         break;
-
     case SERVO_IOCTL_CENTER:
         ret = servo_set_angle_locked(90);
         if (!ret) total_writes++;
         break;
-
     case SERVO_IOCTL_SWEEP: {
         int a, d, s;
         if (copy_from_user(&sw, (struct servo_sweep_cmd __user *)arg, sizeof(sw)))
@@ -268,7 +229,7 @@ static long servo_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
         s = sw.step     > 0 ? sw.step     : 1;
         total_sweeps++;
         if (sw.start_angle <= sw.end_angle) {
-            for (a = sw.start_angle; a <= sw.end_angle && !ret; a += s) {
+            for (a = sw.start_angle; a <= sw.end_angle; a += s) {
                 servo_set_angle_locked(a);
                 mutex_unlock(&servo_mutex);
                 msleep(d);
@@ -276,7 +237,7 @@ static long servo_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
                     return -ERESTARTSYS;
             }
         } else {
-            for (a = sw.start_angle; a >= sw.end_angle && !ret; a -= s) {
+            for (a = sw.start_angle; a >= sw.end_angle; a -= s) {
                 servo_set_angle_locked(a);
                 mutex_unlock(&servo_mutex);
                 msleep(d);
@@ -320,86 +281,116 @@ static int proc_show(struct seq_file *m, void *v)
     mutex_unlock(&servo_mutex);
     return 0;
 }
-static int proc_open(struct inode *inode, struct file *file)
+static int proc_open_fn(struct inode *inode, struct file *file)
 { return single_open(file, proc_show, NULL); }
 
 static const struct proc_ops servo_proc_ops = {
-    .proc_open    = proc_open,
+    .proc_open    = proc_open_fn,
     .proc_read    = seq_read,
     .proc_lseek   = seq_lseek,
     .proc_release = single_release,
 };
+
+/* ── PWM acquisition ─────────────────────────────────────────────────
+ * pwm_request() was removed in kernel 6.x.
+ * We find the BCM2835 PWM platform device by its DT-derived name,
+ * get the pwm_chip from its drvdata, then call pwm_request_from_chip.
+ * The device is named after its register base address in the DT:
+ *   Pi 4 (BCM2711): fe20c000.pwm
+ *   Pi 3 (BCM2835): 3f20c000.pwm  (fallback)
+ */
+static struct pwm_device *servo_acquire_pwm(void)
+{
+    static const char * const names[] = {
+        "fe20c000.pwm",   /* Pi 4 */
+        "3f20c000.pwm",   /* Pi 3 fallback */
+        NULL
+    };
+    struct device    *dev = NULL;
+    struct pwm_chip  *chip;
+    int i;
+
+    for (i = 0; names[i] && !dev; i++)
+        dev = bus_find_device_by_name(&platform_bus_type, NULL, names[i]);
+
+    if (!dev) {
+        pr_err("servo_driver: PWM platform device not found on bus\n");
+        return ERR_PTR(-ENODEV);
+    }
+
+    chip = dev_get_drvdata(dev);
+    put_device(dev);
+
+    if (!chip) {
+        pr_err("servo_driver: no pwm_chip in drvdata\n");
+        return ERR_PTR(-ENODEV);
+    }
+
+    return pwm_request_from_chip(chip, 0, "servo_driver");
+}
 
 /* ── Module init / exit ──────────────────────────────────────────────── */
 static int __init servo_init(void)
 {
     int ret;
 
-    /* 1. Claim PWM channel 0 from pwmchip0 */
-    servo_pwm = pwm_request(0, "servo_driver");
+    servo_pwm = servo_acquire_pwm();
     if (IS_ERR(servo_pwm)) {
-        pr_err("servo_driver: pwm_request failed (%ld) — "
-               "is dtoverlay=pwm,pin=18,func=2 in config.txt?\n",
+        pr_err("servo_driver: failed to acquire PWM (%ld)\n",
                PTR_ERR(servo_pwm));
         return PTR_ERR(servo_pwm);
     }
 
-    /* 2. Apply initial state (centred at 90°) */
     ret = pwm_apply_angle(current_angle);
     if (ret) {
         pr_err("servo_driver: initial pwm_apply failed (%d)\n", ret);
         goto err_pwm;
     }
-    pr_info("servo_driver: PWM claimed, centred at 90°\n");
+    pr_info("servo_driver: PWM acquired and centred at 90 degrees\n");
 
-    /* 3. Allocate char device number */
     ret = alloc_chrdev_region(&servo_dev, 0, 1, "servo");
     if (ret) goto err_pwm;
 
-    /* 4. Register cdev */
     cdev_init(&servo_cdev, &servo_fops);
     servo_cdev.owner = THIS_MODULE;
     ret = cdev_add(&servo_cdev, servo_dev, 1);
     if (ret) goto err_region;
 
-    /* 5. Create /dev/servo */
     servo_class = class_create("servo_class");
     if (IS_ERR(servo_class)) { ret = PTR_ERR(servo_class); goto err_cdev; }
 
     servo_device = device_create(servo_class, NULL, servo_dev, NULL, "servo");
     if (IS_ERR(servo_device)) { ret = PTR_ERR(servo_device); goto err_class; }
 
-    /* 6. Create /proc/servo_stats */
     proc_entry = proc_create("servo_stats", 0444, NULL, &servo_proc_ops);
     if (!proc_entry)
         pr_warn("servo_driver: could not create /proc/servo_stats\n");
 
-    pr_info("servo_driver: loaded — major=%d, /dev/servo ready\n",
+    pr_info("servo_driver: loaded major=%d /dev/servo ready\n",
             MAJOR(servo_dev));
     return 0;
 
 err_class:   class_destroy(servo_class);
 err_cdev:    cdev_del(&servo_cdev);
 err_region:  unregister_chrdev_region(servo_dev, 1);
-err_pwm:     pwm_free(servo_pwm);
+err_pwm:     pwm_put(servo_pwm);
     return ret;
 }
 
 static void __exit servo_exit(void)
 {
-    if (proc_entry)        remove_proc_entry("servo_stats", NULL);
+    if (proc_entry) remove_proc_entry("servo_stats", NULL);
     device_destroy(servo_class, servo_dev);
     class_destroy(servo_class);
     cdev_del(&servo_cdev);
     unregister_chrdev_region(servo_dev, 1);
 
-    /* Disable PWM output and release the channel */
     if (servo_pwm) {
         struct pwm_state state;
         pwm_get_state(servo_pwm, &state);
         state.enabled = false;
         pwm_apply_might_sleep(servo_pwm, &state);
-        pwm_free(servo_pwm);
+        pwm_put(servo_pwm);
     }
     pr_info("servo_driver: unloaded\n");
 }
