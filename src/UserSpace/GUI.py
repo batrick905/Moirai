@@ -33,6 +33,7 @@ class App(tk.Tk):
 		self.log_box = ScrolledText(self, state="disabled", bg="#111111", fg="#00ff00", font=("Monospace", 10))
 		self.log_box.place(x=150, y=100, width=450, height=150)
 		self.refresh_log()
+		self.start_daemon()
 
 	def refresh_log(self):
 		if os.path.exists(LOG_FILE):
@@ -46,7 +47,7 @@ class App(tk.Tk):
 		self.after(1000, self.refresh_log) # checks every second
 
 	def start_daemon(self):
-		t = threading.Thread(targer = nfc_daemon.main, args(self.register_uid, None), daemon=True)
+		t = threading.Thread(targer = nfc_daemon.main, args(self.register_uid,), daemon=True)
 		t.start
 
 if __name__ == "__main__":
