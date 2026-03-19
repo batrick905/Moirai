@@ -366,20 +366,13 @@ static int poll_thread(void *data)
         int ret = pn532_poll_card(dev->spi, uid, &uid_len);
 
         if (ret == 0) {
-            if (!uid_same(uid, uid_len, dev->last_uid, dev->last_uid_len)) {
-                char hex[UID_MAX_LEN * 3 + 1] = {0};
-                int i;
-                for (i = 0; i < uid_len; i++)
-                    snprintf(hex + i * 3, 4, "%02X:", uid[i]);
-                hex[uid_len * 3 - 1] = '\0';
-
-                pr_info("pn532: UID detected: %s\n", hex);
-                log_uid(dev, uid, uid_len);
-                memcpy(dev->last_uid, uid, uid_len);
-                dev->last_uid_len = uid_len;
-            }
-        } else if (ret == -ENODEV) {
-            dev->last_uid_len = 0;
+            char hex[UID_MAX_LEN * 3 + 1] = {0};
+            int i;
+            for (i = 0; i < uid_len; i++)
+                snprintf(hex + i * 3, 4, "%02X:", uid[i]);
+            hex[uid_len * 3 - 1] = '\0';
+            pr_info("pn532: UID detected: %s\n", hex);
+            log_uid(dev, uid, uid_len);
         }
 
         msleep(poll_interval_ms);
