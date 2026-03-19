@@ -89,7 +89,7 @@ def register_uid(uid, db):
 
 # ── Main loop ─────────────────────────────────────────────────────────
 
-def main():
+def main(register_callback):
     print("=" * 55)
     print("  PN532 NFC Daemon")
     print(f"  DB:      {DB_FILE}")
