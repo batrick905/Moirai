@@ -2,8 +2,11 @@
 /*
  * IMX708 Custom Camera Sensor Driver
  * Sony IMX708 12.3MP stacked CMOS sensor
- * Connects via I2C (config) + CSI-2 (image data)
- * Direct I2C — no regmap dependency
+ *
+ * Exposes two interfaces:
+ *   /dev/v4l-subdev0  — V4L2 subdev (sensor config, streaming)
+ *   /dev/imx708_ctrl  — char device  (blocking read/write/ioctl)
+ *   /proc/imx708_custom_stats — stats
  */
 
 #include <linux/module.h>
@@ -11,7 +14,12 @@
 #include <linux/i2c.h>
 #include <linux/delay.h>
 #include <linux/clk.h>
-#include <linux/regmap.h>           /* for struct reg_sequence only */
+#include <linux/cdev.h>
+#include <linux/fs.h>
+#include <linux/uaccess.h>
+#include <linux/wait.h>
+#include <linux/sched.h>
+#include <linux/regmap.h>
 #include <linux/regulator/consumer.h>
 #include <linux/proc_fs.h>
 #include <linux/seq_file.h>
@@ -86,42 +94,40 @@ static int imx708_write_regs(struct imx708_dev *sensor,
    Register sequences for each mode
    ════════════════════════════════════════════════════════════ */
 
-/* Full resolution: 4608x2592 @ ~14fps */
 static const struct reg_sequence mode_4608x2592_regs[] = {
-	{ 0x0136, 0x18 }, { 0x0137, 0x00 }, /* EXCK_FREQ = 24MHz */
-	{ 0x3C7E, 0x01 }, { 0x3C7F, 0x07 }, /* manufacturer specific */
-	{ 0x0300, 0x01 }, { 0x0301, 0x00 }, /* PLL */
+	{ 0x0136, 0x18 }, { 0x0137, 0x00 },
+	{ 0x3C7E, 0x01 }, { 0x3C7F, 0x07 },
+	{ 0x0300, 0x01 }, { 0x0301, 0x00 },
 	{ 0x0302, 0x20 }, { 0x0303, 0x00 },
 	{ 0x0305, 0x04 }, { 0x0306, 0x01 },
 	{ 0x0307, 0x30 },
-	{ 0x0340, 0x0A }, { 0x0341, 0xF0 }, /* FRAME_LENGTH = 2800 */
-	{ 0x0342, 0x4E }, { 0x0343, 0x20 }, /* LINE_LENGTH  = 19984 */
-	{ 0x0344, 0x00 }, { 0x0345, 0x00 }, /* X_ADD_STA = 0 */
-	{ 0x0346, 0x00 }, { 0x0347, 0x00 }, /* Y_ADD_STA = 0 */
-	{ 0x0348, 0x11 }, { 0x0349, 0xFF }, /* X_ADD_END = 4607 */
-	{ 0x034A, 0x0A }, { 0x034B, 0x1F }, /* Y_ADD_END = 2591 */
-	{ 0x0408, 0x00 }, { 0x0409, 0x00 }, /* crop offset */
-	{ 0x040A, 0x00 }, { 0x040B, 0x00 },
-	{ 0x040C, 0x12 }, { 0x040D, 0x00 }, /* output width  = 4608 */
-	{ 0x040E, 0x0A }, { 0x040F, 0x20 }, /* output height = 2592 */
-	{ 0x0820, 0x0F }, { 0x0821, 0xA0 }, /* CSI-2 link freq */
-	{ 0x0822, 0x00 }, { 0x0823, 0x00 },
-};
-
-/* Binned mode: 2304x1296 @ ~56fps (2x2 binning) */
-static const struct reg_sequence mode_2304x1296_regs[] = {
-	{ 0x0136, 0x18 }, { 0x0137, 0x00 },
-	{ 0x0340, 0x05 }, { 0x0341, 0x54 }, /* FRAME_LENGTH = 1364 */
-	{ 0x0342, 0x27 }, { 0x0343, 0x10 }, /* LINE_LENGTH  = 10000 */
+	{ 0x0340, 0x0A }, { 0x0341, 0xF0 },
+	{ 0x0342, 0x4E }, { 0x0343, 0x20 },
 	{ 0x0344, 0x00 }, { 0x0345, 0x00 },
 	{ 0x0346, 0x00 }, { 0x0347, 0x00 },
 	{ 0x0348, 0x11 }, { 0x0349, 0xFF },
 	{ 0x034A, 0x0A }, { 0x034B, 0x1F },
-	{ 0x0380, 0x00 }, { 0x0381, 0x02 }, /* X_INC_ODD = 2 */
+	{ 0x0408, 0x00 }, { 0x0409, 0x00 },
+	{ 0x040A, 0x00 }, { 0x040B, 0x00 },
+	{ 0x040C, 0x12 }, { 0x040D, 0x00 },
+	{ 0x040E, 0x0A }, { 0x040F, 0x20 },
+	{ 0x0820, 0x0F }, { 0x0821, 0xA0 },
+	{ 0x0822, 0x00 }, { 0x0823, 0x00 },
+};
+
+static const struct reg_sequence mode_2304x1296_regs[] = {
+	{ 0x0136, 0x18 }, { 0x0137, 0x00 },
+	{ 0x0340, 0x05 }, { 0x0341, 0x54 },
+	{ 0x0342, 0x27 }, { 0x0343, 0x10 },
+	{ 0x0344, 0x00 }, { 0x0345, 0x00 },
+	{ 0x0346, 0x00 }, { 0x0347, 0x00 },
+	{ 0x0348, 0x11 }, { 0x0349, 0xFF },
+	{ 0x034A, 0x0A }, { 0x034B, 0x1F },
+	{ 0x0380, 0x00 }, { 0x0381, 0x02 },
 	{ 0x0382, 0x00 }, { 0x0383, 0x00 },
-	{ 0x0384, 0x00 }, { 0x0385, 0x02 }, /* Y_INC_ODD = 2 */
+	{ 0x0384, 0x00 }, { 0x0385, 0x02 },
 	{ 0x0386, 0x00 }, { 0x0387, 0x00 },
-	{ 0x0900, 0x01 }, { 0x0901, 0x22 }, /* BINNING on, 2x2 */
+	{ 0x0900, 0x01 }, { 0x0901, 0x22 },
 	{ 0x0820, 0x0F }, { 0x0821, 0xA0 },
 	{ 0x0822, 0x00 }, { 0x0823, 0x00 },
 };
@@ -180,6 +186,215 @@ static const struct proc_ops imx708_proc_ops = {
 	.proc_read    = seq_read,
 	.proc_lseek   = seq_lseek,
 	.proc_release = single_release,
+};
+
+/* ════════════════════════════════════════════════════════════
+   Char device — /dev/imx708_ctrl
+   ════════════════════════════════════════════════════════════ */
+
+static int imx708_cdev_open(struct inode *inode, struct file *file)
+{
+	struct imx708_dev *sensor =
+		container_of(inode->i_cdev, struct imx708_dev, cdev);
+	file->private_data = sensor;
+	dev_info(&sensor->client->dev, "imx708_ctrl opened\n");
+	return 0;
+}
+
+static int imx708_cdev_release(struct inode *inode, struct file *file)
+{
+	struct imx708_dev *sensor = file->private_data;
+	dev_info(&sensor->client->dev, "imx708_ctrl closed\n");
+	return 0;
+}
+
+/*
+ * read() — blocks until a new frame arrives (frame_count increments),
+ * then returns current stats as a text string.
+ *
+ * If sensor is not streaming, returns stats immediately without blocking.
+ */
+static ssize_t imx708_cdev_read(struct file *file, char __user *buf,
+				 size_t count, loff_t *ppos)
+{
+	struct imx708_dev *sensor = file->private_data;
+	char stats[256];
+	int len;
+	int ret;
+
+	/* block until frame_count changes from what we last saw */
+	if (sensor->streaming) {
+		ret = wait_event_interruptible(sensor->wait_queue,
+			sensor->frame_count != sensor->last_frame_seen);
+		if (ret)
+			return -ERESTARTSYS;
+	}
+
+	mutex_lock(&sensor->lock);
+	sensor->last_frame_seen = sensor->frame_count;
+	len = snprintf(stats, sizeof(stats),
+		"frames_captured : %llu\n"
+		"streaming       : %d\n"
+		"width           : %u\n"
+		"height          : %u\n"
+		"exposure        : %d\n"
+		"analogue_gain   : %d\n"
+		"digital_gain    : %d\n",
+		sensor->frame_count,
+		sensor->streaming,
+		sensor->cur_mode->width,
+		sensor->cur_mode->height,
+		sensor->exposure->val,
+		sensor->again->val,
+		sensor->dgain->val);
+	mutex_unlock(&sensor->lock);
+
+	if (*ppos >= len)
+		return 0;
+
+	if (count > len - *ppos)
+		count = len - *ppos;
+
+	if (copy_to_user(buf, stats + *ppos, count))
+		return -EFAULT;
+
+	*ppos += count;
+	return count;
+}
+
+/*
+ * write() — accepts control commands as text:
+ *   "exposure=500\n"
+ *   "gain=100\n"
+ *
+ * Blocks if a write is already in progress.
+ */
+static ssize_t imx708_cdev_write(struct file *file, const char __user *buf,
+				  size_t count, loff_t *ppos)
+{
+	struct imx708_dev *sensor = file->private_data;
+	char cmd[64];
+	unsigned int val;
+	int ret;
+
+	if (count >= sizeof(cmd))
+		return -EINVAL;
+
+	/* block if another write is in progress */
+	ret = wait_event_interruptible(sensor->write_queue,
+				       !sensor->write_busy);
+	if (ret)
+		return -ERESTARTSYS;
+
+	mutex_lock(&sensor->lock);
+	sensor->write_busy = true;
+	mutex_unlock(&sensor->lock);
+
+	if (copy_from_user(cmd, buf, count)) {
+		ret = -EFAULT;
+		goto done;
+	}
+	cmd[count] = '\0';
+
+	/* parse and apply command */
+	if (sscanf(cmd, "exposure=%u", &val) == 1) {
+		ret = imx708_write_reg(sensor, IMX708_REG_EXPOSURE_HI,
+				       (val >> 8) & 0xFF);
+		ret |= imx708_write_reg(sensor, IMX708_REG_EXPOSURE_LO,
+					val & 0xFF);
+		if (!ret) {
+			dev_info(&sensor->client->dev,
+				 "exposure set to %u\n", val);
+			ret = count;
+		}
+	} else if (sscanf(cmd, "gain=%u", &val) == 1) {
+		ret = imx708_write_reg(sensor, IMX708_REG_AGAIN_HI,
+				       (val >> 8) & 0xFF);
+		ret |= imx708_write_reg(sensor, IMX708_REG_AGAIN_LO,
+					val & 0xFF);
+		if (!ret) {
+			dev_info(&sensor->client->dev,
+				 "gain set to %u\n", val);
+			ret = count;
+		}
+	} else {
+		dev_warn(&sensor->client->dev,
+			 "unknown command: %s\n", cmd);
+		ret = -EINVAL;
+	}
+
+done:
+	mutex_lock(&sensor->lock);
+	sensor->write_busy = false;
+	mutex_unlock(&sensor->lock);
+	wake_up_interruptible(&sensor->write_queue);
+
+	return ret;
+}
+
+/*
+ * ioctl() — query chip info and streaming state
+ */
+static long imx708_cdev_ioctl(struct file *file, unsigned int cmd,
+			       unsigned long arg)
+{
+	struct imx708_dev *sensor = file->private_data;
+	unsigned int val;
+
+	switch (cmd) {
+
+	case IMX708_IOC_GET_CHIP_ID:
+		val = IMX708_CHIP_ID;
+		if (copy_to_user((void __user *)arg, &val, sizeof(val)))
+			return -EFAULT;
+		return 0;
+
+	case IMX708_IOC_GET_STREAMING:
+		mutex_lock(&sensor->lock);
+		val = sensor->streaming ? 1 : 0;
+		mutex_unlock(&sensor->lock);
+		if (copy_to_user((void __user *)arg, &val, sizeof(val)))
+			return -EFAULT;
+		return 0;
+
+	case IMX708_IOC_SET_EXPOSURE:
+		if (copy_from_user(&val, (void __user *)arg, sizeof(val)))
+			return -EFAULT;
+		imx708_write_reg(sensor, IMX708_REG_EXPOSURE_HI,
+				 (val >> 8) & 0xFF);
+		imx708_write_reg(sensor, IMX708_REG_EXPOSURE_LO,
+				 val & 0xFF);
+		return 0;
+
+	case IMX708_IOC_SET_GAIN:
+		if (copy_from_user(&val, (void __user *)arg, sizeof(val)))
+			return -EFAULT;
+		imx708_write_reg(sensor, IMX708_REG_AGAIN_HI,
+				 (val >> 8) & 0xFF);
+		imx708_write_reg(sensor, IMX708_REG_AGAIN_LO,
+				 val & 0xFF);
+		return 0;
+
+	case IMX708_IOC_GET_STATS:
+		mutex_lock(&sensor->lock);
+		val = (unsigned int)sensor->frame_count;
+		mutex_unlock(&sensor->lock);
+		if (copy_to_user((void __user *)arg, &val, sizeof(val)))
+			return -EFAULT;
+		return 0;
+
+	default:
+		return -ENOTTY;
+	}
+}
+
+static const struct file_operations imx708_cdev_fops = {
+	.owner          = THIS_MODULE,
+	.open           = imx708_cdev_open,
+	.release        = imx708_cdev_release,
+	.read           = imx708_cdev_read,
+	.write          = imx708_cdev_write,
+	.unlocked_ioctl = imx708_cdev_ioctl,
 };
 
 /* ════════════════════════════════════════════════════════════
@@ -365,6 +580,12 @@ static int imx708_s_stream(struct v4l2_subdev *sd, int enable)
 		imx708_stop_streaming(sensor);
 	mutex_unlock(&sensor->lock);
 
+	/*
+	 * Wake up any readers blocked in imx708_cdev_read() so they can
+	 * notice the streaming state changed.
+	 */
+	wake_up_interruptible(&sensor->wait_queue);
+
 	return ret;
 }
 
@@ -462,12 +683,6 @@ static int imx708_power_on(struct imx708_dev *sensor)
 	struct device *dev = &sensor->client->dev;
 	int ret;
 
-	/*
-	 * Supply names must match the DT property prefix on imx708@1a:
-	 *   "vana1"  → vana1-supply → cam1-reg  (real 2.8 V power rail)
-	 *   "vdig"   → vdig-supply  → cam-dummy-reg
-	 *   "vddl"   → vddl-supply  → cam-dummy-reg
-	 */
 	sensor->vana = devm_regulator_get(dev, "vana1");
 	sensor->vdig = devm_regulator_get(dev, "vdig");
 	sensor->vddl = devm_regulator_get(dev, "vddl");
@@ -490,15 +705,11 @@ static int imx708_power_on(struct imx708_dev *sensor)
 		}
 	}
 
-	/* DT: off-on-delay = 30 ms, startup-delay = 70 ms → wait 120 ms */
 	msleep(120);
 
-	/* Enable clock */
 	sensor->xclk = devm_clk_get(dev, "inclk");
-	if (IS_ERR(sensor->xclk)) {
-		dev_warn(dev, "inclk not found, trying unnamed clock\n");
+	if (IS_ERR(sensor->xclk))
 		sensor->xclk = devm_clk_get(dev, NULL);
-	}
 	if (!IS_ERR(sensor->xclk)) {
 		clk_set_rate(sensor->xclk, 24000000);
 		ret = clk_prepare_enable(sensor->xclk);
@@ -506,9 +717,7 @@ static int imx708_power_on(struct imx708_dev *sensor)
 			dev_warn(dev, "clock enable failed: %d\n", ret);
 	}
 
-	/* Sensor needs time after clock before I2C is ready */
 	msleep(20);
-
 	return 0;
 }
 
@@ -531,39 +740,41 @@ static void imx708_power_off(struct imx708_dev *sensor)
 static int imx708_probe(struct i2c_client *client)
 {
 	struct imx708_dev *sensor;
+	struct device *dev = &client->dev;
 	u8 id_hi, id_lo;
 	u16 chip_id;
 	int ret;
 
-	sensor = devm_kzalloc(&client->dev, sizeof(*sensor), GFP_KERNEL);
+	sensor = devm_kzalloc(dev, sizeof(*sensor), GFP_KERNEL);
 	if (!sensor)
 		return -ENOMEM;
 
 	sensor->client   = client;
 	sensor->cur_mode = &supported_modes[0];
 	mutex_init(&sensor->lock);
+	init_waitqueue_head(&sensor->wait_queue);
+	init_waitqueue_head(&sensor->write_queue);
 	i2c_set_clientdata(client, sensor);
 
-	/* ── Power on sensor ── */
+	/* ── Power on ── */
 	ret = imx708_power_on(sensor);
 	if (ret)
 		goto err_mutex;
 
-	/* ── Verify chip identity over I2C ── */
+	/* ── Chip ID check ── */
 	ret = imx708_read_reg(sensor, IMX708_REG_CHIP_ID, &id_hi);
 	if (ret) {
-		dev_err(&client->dev, "chip ID hi read failed: %d\n", ret);
+		dev_err(dev, "chip ID hi read failed: %d\n", ret);
 		goto err_power;
 	}
 	ret = imx708_read_reg(sensor, IMX708_REG_CHIP_ID + 1, &id_lo);
 	if (ret) {
-		dev_err(&client->dev, "chip ID lo read failed: %d\n", ret);
+		dev_err(dev, "chip ID lo read failed: %d\n", ret);
 		goto err_power;
 	}
 	chip_id = ((u16)id_hi << 8) | id_lo;
 	if (chip_id != IMX708_CHIP_ID) {
-		dev_err(&client->dev,
-			"unexpected chip ID 0x%04x (expected 0x%04x)\n",
+		dev_err(dev, "unexpected chip ID 0x%04x (expected 0x%04x)\n",
 			chip_id, IMX708_CHIP_ID);
 		ret = -ENODEV;
 		goto err_power;
@@ -575,46 +786,77 @@ static int imx708_probe(struct i2c_client *client)
 	sensor->fmt.code   = MEDIA_BUS_FMT_SRGGB10_1X10;
 	sensor->fmt.field  = V4L2_FIELD_NONE;
 
-	/* ── Init V4L2 subdevice ── */
+	/* ── V4L2 subdev ── */
 	v4l2_i2c_subdev_init(&sensor->sd, client, &imx708_subdev_ops);
 	sensor->sd.flags |= V4L2_SUBDEV_FL_HAS_DEVNODE;
 	sensor->sd.entity.function = MEDIA_ENT_F_CAM_SENSOR;
 
-	/* ── Init media pad ── */
 	sensor->pad.flags = MEDIA_PAD_FL_SOURCE;
 	ret = media_entity_pads_init(&sensor->sd.entity, 1, &sensor->pad);
 	if (ret) {
-		dev_err(&client->dev, "media entity init failed: %d\n", ret);
+		dev_err(dev, "media entity init failed: %d\n", ret);
 		goto err_power;
 	}
 
-	/* ── Init controls ── */
 	ret = imx708_init_controls(sensor);
 	if (ret) {
-		dev_err(&client->dev, "controls init failed: %d\n", ret);
+		dev_err(dev, "controls init failed: %d\n", ret);
 		goto err_entity;
 	}
 
-	/* ── Register with V4L2 async framework ── */
 	ret = v4l2_async_register_subdev(&sensor->sd);
 	if (ret) {
-		dev_err(&client->dev, "v4l2 register failed: %d\n", ret);
+		dev_err(dev, "v4l2 register failed: %d\n", ret);
 		goto err_controls;
 	}
 
-	/* ── Create /proc entry ── */
-	sensor->proc_entry = proc_create_data(IMX708_PROC_NAME, 0444,
-					       NULL, &imx708_proc_ops,
-					       sensor);
-	if (!sensor->proc_entry)
-		dev_warn(&client->dev, "failed to create /proc/%s\n",
-			 IMX708_PROC_NAME);
+	/* ── Char device /dev/imx708_ctrl ── */
+	ret = alloc_chrdev_region(&sensor->cdev_num, 0, 1, IMX708_CDEV_NAME);
+	if (ret) {
+		dev_err(dev, "alloc_chrdev_region failed: %d\n", ret);
+		goto err_v4l2;
+	}
 
-	dev_info(&client->dev,
-		 "IMX708 custom driver ready: %ux%u chip_id=0x%04x\n",
-		 sensor->cur_mode->width, sensor->cur_mode->height, chip_id);
+	cdev_init(&sensor->cdev, &imx708_cdev_fops);
+	sensor->cdev.owner = THIS_MODULE;
+	ret = cdev_add(&sensor->cdev, sensor->cdev_num, 1);
+	if (ret) {
+		dev_err(dev, "cdev_add failed: %d\n", ret);
+		goto err_chrdev;
+	}
+
+	sensor->cdev_class = class_create(IMX708_CDEV_NAME);
+	if (IS_ERR(sensor->cdev_class)) {
+		ret = PTR_ERR(sensor->cdev_class);
+		dev_err(dev, "class_create failed: %d\n", ret);
+		goto err_cdev;
+	}
+
+	if (IS_ERR(device_create(sensor->cdev_class, NULL,
+				  sensor->cdev_num, NULL,
+				  IMX708_CDEV_NAME))) {
+		dev_warn(dev, "device_create failed\n");
+	}
+
+	/* ── /proc ── */
+	sensor->proc_entry = proc_create_data(IMX708_PROC_NAME, 0444,
+					       NULL, &imx708_proc_ops, sensor);
+	if (!sensor->proc_entry)
+		dev_warn(dev, "failed to create /proc/%s\n", IMX708_PROC_NAME);
+
+	dev_info(dev,
+		 "IMX708 custom driver ready: %ux%u chip_id=0x%04x\n"
+		 "  /dev/imx708_ctrl and /proc/%s created\n",
+		 sensor->cur_mode->width, sensor->cur_mode->height,
+		 chip_id, IMX708_PROC_NAME);
 	return 0;
 
+err_cdev:
+	cdev_del(&sensor->cdev);
+err_chrdev:
+	unregister_chrdev_region(sensor->cdev_num, 1);
+err_v4l2:
+	v4l2_async_unregister_subdev(&sensor->sd);
 err_controls:
 	v4l2_ctrl_handler_free(&sensor->ctrl_handler);
 err_entity:
@@ -632,6 +874,11 @@ static void imx708_remove(struct i2c_client *client)
 
 	if (sensor->proc_entry)
 		remove_proc_entry(IMX708_PROC_NAME, NULL);
+
+	device_destroy(sensor->cdev_class, sensor->cdev_num);
+	class_destroy(sensor->cdev_class);
+	cdev_del(&sensor->cdev);
+	unregister_chrdev_region(sensor->cdev_num, 1);
 
 	v4l2_async_unregister_subdev(&sensor->sd);
 	v4l2_ctrl_handler_free(&sensor->ctrl_handler);

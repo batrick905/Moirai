@@ -3,6 +3,8 @@
 
 #include <linux/i2c.h>
 #include <linux/clk.h>
+#include <linux/cdev.h>
+#include <linux/wait.h>
 #include <linux/regulator/consumer.h>
 #include <media/v4l2-device.h>
 #include <media/v4l2-subdev.h>
@@ -54,6 +56,15 @@
 /* ── Driver identity ── */
 #define IMX708_DRIVER_NAME          "imx708-custom"
 #define IMX708_PROC_NAME            "imx708_custom_stats"
+#define IMX708_CDEV_NAME            "imx708_ctrl"
+
+/* ── ioctl commands for /dev/imx708_ctrl ── */
+#define IMX708_IOC_MAGIC            'I'
+#define IMX708_IOC_GET_CHIP_ID      _IOR(IMX708_IOC_MAGIC, 1, unsigned int)
+#define IMX708_IOC_GET_STREAMING    _IOR(IMX708_IOC_MAGIC, 2, unsigned int)
+#define IMX708_IOC_SET_EXPOSURE     _IOW(IMX708_IOC_MAGIC, 3, unsigned int)
+#define IMX708_IOC_SET_GAIN         _IOW(IMX708_IOC_MAGIC, 4, unsigned int)
+#define IMX708_IOC_GET_STATS        _IOR(IMX708_IOC_MAGIC, 5, unsigned int)
 
 struct imx708_mode {
 	u32 width, height;
@@ -73,13 +84,7 @@ struct imx708_dev {
 	struct v4l2_mbus_framefmt    fmt;
 	struct mutex                 lock;
 
-	/*
-	 * Power supplies — names passed to devm_regulator_get() must match
-	 * the DT property prefix on the imx708@1a node:
-	 *   vana1-supply  → cam1-reg  (GPIO-switched 2.8 V — real sensor power)
-	 *   vdig-supply   → cam-dummy-reg
-	 *   vddl-supply   → cam-dummy-reg
-	 */
+	/* power */
 	struct regulator            *vana;
 	struct regulator            *vdig;
 	struct regulator            *vddl;
@@ -99,6 +104,20 @@ struct imx708_dev {
 
 	/* /proc entry */
 	struct proc_dir_entry       *proc_entry;
+
+	/*
+	 * Char device — /dev/imx708_ctrl
+	 * Userspace can open/read/write/ioctl this directly.
+	 * read()  blocks on wait_queue until frame_count increments.
+	 * write() accepts "exposure=N" / "gain=N" commands.
+	 */
+	struct cdev                  cdev;
+	struct class                *cdev_class;
+	dev_t                        cdev_num;
+	wait_queue_head_t            wait_queue;
+	u64                          last_frame_seen;  /* for blocking read */
+	bool                         write_busy;       /* for blocking write */
+	wait_queue_head_t            write_queue;
 };
 
 #endif /* IMX708_CUSTOM_H */
