@@ -1,9 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * pn532_spi.c - PN532 NFC Reader LKM over SPI (Fixed Handshake)
- *
- * This version implements the strict Command -> ACK -> Wait -> Response flow
- * required by the PN532 SPI interface.
+ * pn532_spi.c - PN532 NFC Reader LKM over SPI
+ * Version 1.3 - Long Preamble Wakeup & Diagnostic Logging
  */
 
 #include <linux/module.h>
@@ -21,8 +19,8 @@
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Gemini AI / Original Author");
-MODULE_DESCRIPTION("PN532 SPI NFC reader with strict ACK/Ready handshake");
-MODULE_VERSION("1.2");
+MODULE_DESCRIPTION("PN532 SPI NFC reader with Diagnostic Handshake");
+MODULE_VERSION("1.3");
 
 /* ── Tunables ────────────────────────────────────────────────────── */
 
@@ -38,13 +36,11 @@ module_param(poll_interval_ms, uint, 0444);
 #define PN532_SPI_DATAWRITE  0x80  /* Raw 0x01 */
 #define PN532_SPI_STATREAD   0x40  /* Raw 0x02 */
 #define PN532_SPI_DATAREAD   0xC0  /* Raw 0x03 */
-#define PN532_SPI_READY      0x80  /* Raw 0x01, indicates chip is ready */
+#define PN532_SPI_READY      0x80  /* Raw 0x01 (Ready bit is LSB, so 0x80 MSB) */
 
-/* TFI */
 #define PN532_HOST_TO_PN532  0xD4
 #define PN532_PN532_TO_HOST  0xD5
 
-/* Commands */
 #define PN532_CMD_SAMCONFIGURATION    0x14
 #define PN532_CMD_INLISTPASSIVETARGET 0x4A
 
@@ -107,7 +103,7 @@ static int pn532_wait_ready(struct spi_device *spi) {
 
     while (retries--) {
         spi_transfer_buf(spi, tx, rx, 2);
-        /* PN532 ready bit is 0x01 LSB. On MSB-first RPi, that's 0x80 */
+        /* 0x80 is the bit-reversed value of the PN532 'Ready' status (0x01) */
         if (rx[1] == PN532_SPI_READY)
             return 0;
         usleep_range(1000, 2000);
@@ -149,7 +145,7 @@ static int pn532_read_response(struct spi_device *spi, u8 *buf, size_t max_len) 
     return ret < 0 ? ret : (int)max_len;
 }
 
-/* ── SAM Config ──────────────────────────────────────────────────── */
+/* ── SAM Config with Diagnostics ─────────────────────────────────── */
 
 static int pn532_sam_config(struct spi_device *spi) {
     u8 ack[6];
@@ -160,16 +156,30 @@ static int pn532_sam_config(struct spi_device *spi) {
     ret = pn532_send_frame(spi, sam_config_frame, sizeof(sam_config_frame));
     if (ret < 0) return ret;
 
-    /* 2. Read ACK Immediately */
+    /* 2. Read ACK Immediately (Wait up to 10ms for ACK to appear) */
+    msleep(2);
     ret = pn532_read_response(spi, ack, 6);
     if (ret < 0) return ret;
 
-    /* 3. Wait for Chip to Process */
+    pr_info("pn532: ACK Check: %02X %02X %02X %02X %02X %02X\n",
+            ack[0], ack[1], ack[2], ack[3], ack[4], ack[5]);
+
+    /* Standard PN532 ACK: 00 00 FF 00 FF 00 */
+    if (ack[2] != 0xFF) {
+        pr_err("pn532: Hardware returned invalid ACK or no response.\n");
+        return -EIO;
+    }
+
+    /* 3. Wait for Chip Ready */
     ret = pn532_wait_ready(spi);
-    if (ret < 0) return ret;
+    if (ret < 0) {
+        pr_err("pn532: Timeout waiting for SAM response ready bit.\n");
+        return ret;
+    }
 
     /* 4. Read Actual Response */
-    return pn532_read_response(spi, resp, 9);
+    ret = pn532_read_response(spi, resp, 9);
+    return ret;
 }
 
 /* ── Card Polling ────────────────────────────────────────────────── */
@@ -182,7 +192,7 @@ static int pn532_poll_card(struct spi_device *spi, u8 *uid, u8 *uid_len) {
     ret = pn532_send_frame(spi, inlist_frame, sizeof(inlist_frame));
     if (ret < 0) return ret;
 
-    /* Clear ACK */
+    /* Clear ACK buffer */
     pn532_read_response(spi, ack, 6);
 
     ret = pn532_wait_ready(spi);
@@ -191,8 +201,8 @@ static int pn532_poll_card(struct spi_device *spi, u8 *uid, u8 *uid_len) {
     ret = pn532_read_response(spi, resp, sizeof(resp));
     if (ret < 0) return ret;
 
-    /* Parse Logic */
     if (resp[5] != PN532_PN532_TO_HOST || resp[7] == 0) return -ENODEV;
+    
     *uid_len = resp[12];
     if (*uid_len > UID_MAX_LEN) *uid_len = UID_MAX_LEN;
     memcpy(uid, &resp[13], *uid_len);
@@ -262,6 +272,7 @@ static const struct proc_ops pn532_proc_ops = {
 
 static int pn532_probe(struct spi_device *spi) {
     struct pn532_dev *dev;
+    u8 wakeup[] = { 0x55, 0x55, 0x00, 0x00, 0x00 };
     int ret;
 
     spi->mode = SPI_MODE_0;
@@ -274,18 +285,23 @@ static int pn532_probe(struct spi_device *spi) {
     mutex_init(&dev->log_lock);
     spi_set_drvdata(spi, dev);
 
-    msleep(100); 
-    /* Wake-up: Send a dummy read */
-    u8 dummy = PN532_SPI_STATREAD;
-    spi_write(spi, &dummy, 1);
-    msleep(10);
+    /* LONG PREAMBLE WAKEUP
+     * Sending 0x55 wakes the chip's SPI bus interface. 
+     * The zeros provide time for the internal oscillator to start.
+     */
+    spi_write(spi, wakeup, sizeof(wakeup));
+    msleep(50); 
 
-    if (pn532_sam_config(spi) < 0) return -EIO;
+    ret = pn532_sam_config(spi);
+    if (ret < 0) {
+        dev_err(&spi->dev, "SAMConfiguration failed with %d. Check dmesg for ACK RAW.\n", ret);
+        return ret;
+    }
 
     dev->proc_entry = proc_create_data(PROC_FILENAME, 0444, NULL, &pn532_proc_ops, dev);
     dev->poll_task = kthread_run(poll_thread, dev, "pn532_poll");
     
-    dev_info(&spi->dev, "PN532 Initialized on SPI\n");
+    dev_info(&spi->dev, "PN532 Initialized successfully\n");
     return 0;
 }
 
