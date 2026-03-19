@@ -177,7 +177,7 @@ static int pn532_wait_ready(struct spi_device *spi)
         pr_info("pn532: wait_ready rx[1]=0x%02x rev=0x%02x\n",
                 rx[1], bitrev8(rx[1]));
 
-        if (bitrev8(rx[1]) == PN532_SPI_READY)
+        if (rx[1] == 0x01)
             return 0;
 
         msleep(10);
