@@ -477,7 +477,7 @@ static const struct spi_device_id pn532_spi_id[] = {
     { }
 };
 MODULE_DEVICE_TABLE(spi, pn532_spi_id);
-
+//
 static const struct of_device_id pn532_of_match[] = {
     { .compatible = "nxp,pn532" },
     { }
