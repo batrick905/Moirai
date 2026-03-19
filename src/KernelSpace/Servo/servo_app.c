@@ -1,17 +1,3 @@
-/*
- * servo_app.c - Multi-process/threaded user-space demo for servo_driver
- *
- * Demonstrates:
- *   - Basic angle writes via write()
- *   - Blocking reads via read() (waits for angle change)
- *   - ioctl commands
- *   - Forked child process that independently reads angle updates
- *   - POSIX threads for concurrent sweep + monitor
- *
- * Build:  gcc -Wall -o servo_app servo_app.c -lpthread
- * Run:    sudo ./servo_app [--demo] [--angle <deg>] [--sweep] [--interactive]
- */
-
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -23,12 +9,10 @@
 #include <sys/wait.h>
 #include <sys/types.h>
 
-/* Include shared ioctl definitions (userspace-safe) */
 #ifndef __KERNEL__
 #include <linux/ioctl.h>
 #endif
 
-/* ── Reproduce ioctl definitions without kernel headers ─────────────── */
 #define SERVO_IOC_MAGIC 'S'
 
 struct servo_sweep_cmd {
@@ -45,7 +29,6 @@ struct servo_sweep_cmd {
 
 #define DEVICE "/dev/servo"
 
-/* ── Helpers ─────────────────────────────────────────────────────────── */
 static int open_device(int flags)
 {
     int fd = open(DEVICE, flags);
@@ -63,7 +46,7 @@ static void set_angle_write(int fd, int angle)
     if (write(fd, buf, len) < 0)
         perror("write");
     else
-        printf("[write] Sent angle: %d°\n", angle);
+        printf("[write] Sent angle: %d\n", angle);
 }
 
 static void set_angle_ioctl(int fd, int angle)
@@ -71,7 +54,7 @@ static void set_angle_ioctl(int fd, int angle)
     if (ioctl(fd, SERVO_IOCTL_SET_ANGLE, &angle) < 0)
         perror("ioctl SET_ANGLE");
     else
-        printf("[ioctl] Set angle: %d°\n", angle);
+        printf("[ioctl] Set angle: %d\n", angle);
 }
 
 static int get_angle_ioctl(int fd)
@@ -82,7 +65,6 @@ static int get_angle_ioctl(int fd)
     return angle;
 }
 
-/* ── Thread: blocking reader ─────────────────────────────────────────── */
 typedef struct { int fd; int max_reads; } reader_args_t;
 
 static void *reader_thread(void *arg)
@@ -93,7 +75,6 @@ static void *reader_thread(void *arg)
 
     printf("[reader_thread] started, will do %d blocking reads\n", a->max_reads);
     for (i = 0; i < a->max_reads; i++) {
-        /* This read() BLOCKS until the driver wakes us via the wait queue */
         n = read(a->fd, buf, sizeof(buf) - 1);
         if (n < 0) {
             if (errno == EINTR) break;
@@ -101,13 +82,12 @@ static void *reader_thread(void *arg)
             break;
         }
         buf[n] = '\0';
-        printf("[reader_thread] angle change → %s", buf);
+        printf("[reader_thread] angle change -> %s", buf);
     }
     printf("[reader_thread] done\n");
     return NULL;
 }
 
-/* ── Thread: sweep writer ────────────────────────────────────────────── */
 typedef struct { int start; int end; int step; int delay_ms; } sweep_args_t;
 
 static void *sweep_thread(void *arg)
@@ -117,13 +97,12 @@ static void *sweep_thread(void *arg)
     char buf[64];
     int  len;
 
-    printf("[sweep_thread] sweep %d→%d step=%d delay=%dms\n",
+    printf("[sweep_thread] sweep %d->%d step=%d delay=%dms\n",
            a->start, a->end, a->step, a->delay_ms);
 
     len = snprintf(buf, sizeof(buf), "sweep %d %d %d %d\n",
                    a->start, a->end, a->step, a->delay_ms);
 
-    /* write() will BLOCK inside the kernel while the sweep runs */
     if (write(fd, buf, len) < 0)
         perror("write sweep");
     else
@@ -133,7 +112,6 @@ static void *sweep_thread(void *arg)
     return NULL;
 }
 
-/* ── Interactive CLI ─────────────────────────────────────────────────── */
 static void interactive_mode(void)
 {
     int  fd = open_device(O_RDWR);
@@ -143,7 +121,7 @@ static void interactive_mode(void)
     printf("Commands:\n");
     printf("  <angle>              : set angle 0-180\n");
     printf("  sweep <s> <e> <step> : sweep with 20ms delay\n");
-    printf("  center               : go to 90°\n");
+    printf("  center               : go to 90\n");
     printf("  get                  : read current angle\n");
     printf("  stats                : show /proc/servo_stats\n");
     printf("  quit                 : exit\n\n");
@@ -161,9 +139,9 @@ static void interactive_mode(void)
 
         if (strcmp(line, "center") == 0) {
             ioctl(fd, SERVO_IOCTL_CENTER);
-            printf("Centred at 90°\n");
+            printf("Centred at 90\n");
         } else if (strcmp(line, "get") == 0) {
-            printf("Current angle: %d°\n", get_angle_ioctl(fd));
+            printf("Current angle: %d\n", get_angle_ioctl(fd));
         } else if (strcmp(line, "stats") == 0) {
             system("cat /proc/servo_stats");
         } else if (strncmp(line, "sweep ", 6) == 0) {
@@ -184,7 +162,6 @@ static void interactive_mode(void)
     close(fd);
 }
 
-/* ── Demo mode ───────────────────────────────────────────────────────── */
 static void demo_mode(void)
 {
     int          fd_rw, fd_read;
@@ -198,21 +175,18 @@ static void demo_mode(void)
     fd_rw   = open_device(O_RDWR);
     fd_read = open_device(O_RDONLY);
 
-    /* ── Part 1: simple write() moves ── */
     printf("--- Part 1: Basic angle writes ---\n");
     set_angle_write(fd_rw, 0);    sleep(1);
     set_angle_write(fd_rw, 90);   sleep(1);
     set_angle_write(fd_rw, 180);  sleep(1);
     set_angle_write(fd_rw, 90);   sleep(1);
 
-    /* ── Part 2: ioctl ── */
     printf("\n--- Part 2: ioctl commands ---\n");
     set_angle_ioctl(fd_rw, 45);   sleep(1);
-    printf("[ioctl] Current angle: %d°\n", get_angle_ioctl(fd_rw));
+    printf("[ioctl] Current angle: %d\n", get_angle_ioctl(fd_rw));
     ioctl(fd_rw, SERVO_IOCTL_CENTER);
     printf("[ioctl] Centred\n");   sleep(1);
 
-    /* ── Part 3: blocking reader thread + sweep writer thread ── */
     printf("\n--- Part 3: Concurrent blocking read + sweep (threads) ---\n");
     rargs.fd        = fd_read;
     rargs.max_reads = 10;
@@ -228,12 +202,10 @@ static void demo_mode(void)
     pthread_cancel(reader_tid);
     pthread_join(reader_tid, NULL);
 
-    /* ── Part 4: forked child process reads while parent writes ── */
     printf("\n--- Part 4: Multi-process demo (fork) ---\n");
     fflush(stdout);
     pid = fork();
     if (pid == 0) {
-        /* Child: blocking reader */
         int cfd = open_device(O_RDONLY);
         char cbuf[32];
         int  n, count = 0;
@@ -242,13 +214,12 @@ static void demo_mode(void)
             n = read(cfd, cbuf, sizeof(cbuf) - 1);
             if (n <= 0) break;
             cbuf[n] = '\0';
-            printf("[child  pid=%d] angle → %s", getpid(), cbuf);
+            printf("[child  pid=%d] angle -> %s", getpid(), cbuf);
             count++;
         }
         close(cfd);
         exit(0);
     } else if (pid > 0) {
-        /* Parent: writes 5 angles with 300ms gaps */
         int angles[] = {30, 60, 90, 120, 150};
         int i;
         printf("[parent pid=%d] writing angles...\n", getpid());
@@ -262,7 +233,6 @@ static void demo_mode(void)
         perror("fork");
     }
 
-    /* ── Part 5: print stats ── */
     printf("\n--- Part 5: /proc/servo_stats ---\n");
     system("cat /proc/servo_stats");
 
@@ -271,7 +241,6 @@ static void demo_mode(void)
     printf("\nDemo complete.\n");
 }
 
-/* ── main ────────────────────────────────────────────────────────────── */
 int main(int argc, char *argv[])
 {
     if (argc < 2) {
@@ -283,16 +252,13 @@ int main(int argc, char *argv[])
 
     if (strcmp(argv[1], "--demo") == 0) {
         demo_mode();
-
     } else if (strcmp(argv[1], "--interactive") == 0) {
         interactive_mode();
-
     } else if (strcmp(argv[1], "--angle") == 0 && argc >= 3) {
         int angle = atoi(argv[2]);
         int fd    = open_device(O_WRONLY);
         set_angle_ioctl(fd, angle);
         close(fd);
-
     } else if (strcmp(argv[1], "--sweep") == 0 && argc >= 5) {
         struct servo_sweep_cmd sw;
         int fd = open_device(O_RDWR);
@@ -303,9 +269,8 @@ int main(int argc, char *argv[])
         if (ioctl(fd, SERVO_IOCTL_SWEEP, &sw) < 0)
             perror("ioctl SWEEP");
         else
-            printf("Sweep %d→%d done\n", sw.start_angle, sw.end_angle);
+            printf("Sweep %d->%d done\n", sw.start_angle, sw.end_angle);
         close(fd);
-
     } else {
         fprintf(stderr, "Unknown option: %s\n", argv[1]);
         return 1;
