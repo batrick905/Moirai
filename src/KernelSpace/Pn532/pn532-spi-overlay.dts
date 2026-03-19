@@ -1,7 +1,4 @@
 /*
- * pn532-spi-overlay.dts
- *
- * Device Tree overlay to register the PN532 on SPI0, chip-select 0.
  * Compile with:
  *   dtc -@ -I dts -O dtb -o pn532-spi.dtbo pn532-spi-overlay.dts
  * Install on Raspberry Pi:
