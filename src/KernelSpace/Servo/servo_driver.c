@@ -1,13 +1,3 @@
-/*
- * servo_driver.c - Linux Kernel Module for Micro Servo on Raspberry Pi 4
- * Version 5 — kernel 6.12 compatible
- *
- * Uses pwm_config() + pwm_enable() instead of pwm_apply_might_sleep()
- * which hangs on 6.12 when using a borrowed chip->pwms[] pointer.
- *
- * Requires: dtoverlay=pwm,pin=18,func=2 in /boot/firmware/config.txt
- */
-
 #include <linux/module.h>
 #include <linux/kernel.h>
 #include <linux/init.h>
@@ -29,14 +19,12 @@ MODULE_AUTHOR("OS Project Team");
 MODULE_DESCRIPTION("Micro Servo Driver for Raspberry Pi 4 via Kernel PWM API");
 MODULE_VERSION("5.0");
 
-/* ── Servo PWM parameters ────────────────────────────────────────────── */
-#define PWM_PERIOD_NS       20000000    /* 20ms = 50Hz                   */
-#define SERVO_MIN_NS         1000000    /* 1ms  = 0 degrees              */
-#define SERVO_MAX_NS         2000000    /* 2ms  = 180 degrees            */
+#define PWM_PERIOD_NS       20000000
+#define SERVO_MIN_NS         1000000
+#define SERVO_MAX_NS         2000000
 #define SERVO_MIN_ANGLE      0
 #define SERVO_MAX_ANGLE      180
 
-/* ── IOCTL definitions ───────────────────────────────────────────────── */
 #define SERVO_IOC_MAGIC     'S'
 #define SERVO_IOCTL_SET_ANGLE   _IOW(SERVO_IOC_MAGIC, 1, int)
 #define SERVO_IOCTL_GET_ANGLE   _IOR(SERVO_IOC_MAGIC, 2, int)
@@ -50,7 +38,6 @@ struct servo_sweep_cmd {
     int delay_ms;
 };
 
-/* ── Module state ────────────────────────────────────────────────────── */
 static dev_t             servo_dev;
 static struct cdev       servo_cdev;
 static struct class     *servo_class;
@@ -70,7 +57,6 @@ static int angle_changed = 0;
 
 static struct proc_dir_entry *proc_entry;
 
-/* ── PWM helpers ─────────────────────────────────────────────────────── */
 static int angle_to_ns(int angle)
 {
     return SERVO_MIN_NS +
@@ -97,7 +83,6 @@ static int pwm_set_angle(int angle)
     return 0;
 }
 
-/* Must be called with servo_mutex held */
 static int servo_set_angle_locked(int angle)
 {
     int ret;
@@ -120,7 +105,6 @@ static int servo_set_angle_locked(int angle)
     return 0;
 }
 
-/* ── File operations ─────────────────────────────────────────────────── */
 static int servo_open(struct inode *inode, struct file *file)
 {
     pr_debug("servo_driver: opened\n");
@@ -133,10 +117,6 @@ static int servo_release(struct inode *inode, struct file *file)
     return 0;
 }
 
-/*
- * read() — blocks until the angle changes, then returns it.
- * Demonstrates blocking read via wait queue.
- */
 static ssize_t servo_read(struct file *file, char __user *buf,
                            size_t count, loff_t *ppos)
 {
@@ -164,13 +144,6 @@ static ssize_t servo_read(struct file *file, char __user *buf,
     return len;
 }
 
-/*
- * write() — accepts:
- *   "<angle>"                         e.g. "90"
- *   "sweep <start> <end> <step> [delay_ms]"
- *
- * Blocking: sweep holds mutex for duration, other writers block.
- */
 static ssize_t servo_write(struct file *file, const char __user *buf,
                             size_t count, loff_t *ppos)
 {
@@ -297,7 +270,6 @@ static const struct file_operations servo_fops = {
     .unlocked_ioctl = servo_ioctl,
 };
 
-/* ── /proc/servo_stats ───────────────────────────────────────────────── */
 static int proc_show(struct seq_file *m, void *v)
 {
     mutex_lock(&servo_mutex);
@@ -327,11 +299,6 @@ static const struct proc_ops servo_proc_ops = {
     .proc_release = single_release,
 };
 
-/* ── PWM acquisition ─────────────────────────────────────────────────
- * pwm_request() and pwm_request_from_chip() are removed in kernel 6.12.
- * We find the BCM2711 PWM platform device by name, get the pwm_chip
- * from its drvdata, and borrow &chip->pwms[0] directly.
- */
 static struct pwm_device *servo_acquire_pwm(void)
 {
     struct device   *dev;
@@ -361,21 +328,17 @@ static struct pwm_device *servo_acquire_pwm(void)
     return &chip->pwms[0];
 }
 
-/* ── Module init / exit ──────────────────────────────────────────────── */
 static int __init servo_init(void)
 {
     int ret;
 
-    /* 1. Get PWM channel */
     servo_pwm = servo_acquire_pwm();
     if (IS_ERR(servo_pwm)) {
-        pr_err("servo_driver: failed to acquire PWM (%ld)\n"
-               "  Ensure dtoverlay=pwm,pin=18,func=2 is in /boot/firmware/config.txt\n",
+        pr_err("servo_driver: failed to acquire PWM (%ld)\n",
                PTR_ERR(servo_pwm));
         return PTR_ERR(servo_pwm);
     }
 
-    /* 2. Configure and enable PWM — centre at 90 degrees */
     ret = pwm_config(servo_pwm, angle_to_ns(current_angle), PWM_PERIOD_NS);
     if (ret) {
         pr_err("servo_driver: pwm_config failed (%d)\n", ret);
@@ -390,14 +353,12 @@ static int __init servo_init(void)
 
     pr_info("servo_driver: PWM enabled, servo centred at 90 degrees\n");
 
-    /* 3. Allocate char device number */
     ret = alloc_chrdev_region(&servo_dev, 0, 1, "servo");
     if (ret) {
         pr_err("servo_driver: alloc_chrdev_region failed (%d)\n", ret);
         goto err_pwm;
     }
 
-    /* 4. Register cdev */
     cdev_init(&servo_cdev, &servo_fops);
     servo_cdev.owner = THIS_MODULE;
     ret = cdev_add(&servo_cdev, servo_dev, 1);
@@ -406,7 +367,6 @@ static int __init servo_init(void)
         goto err_region;
     }
 
-    /* 5. Create /dev/servo */
     servo_class = class_create("servo_class");
     if (IS_ERR(servo_class)) {
         ret = PTR_ERR(servo_class);
@@ -419,7 +379,6 @@ static int __init servo_init(void)
         goto err_class;
     }
 
-    /* 6. Create /proc/servo_stats */
     proc_entry = proc_create("servo_stats", 0444, NULL, &servo_proc_ops);
     if (!proc_entry)
         pr_warn("servo_driver: could not create /proc/servo_stats\n");
