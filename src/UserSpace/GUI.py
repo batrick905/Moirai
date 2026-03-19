@@ -1,60 +1,95 @@
-import tkinter as tk
-import sys
-sys.path.append("/home/artursiuda/Moirai/src/KernelSpace")
-import NFC_daemon
-import threading
+mport tkinter as tk
 from tkinter.scrolledtext import ScrolledText
-import tkinter.simpledialog as simpledialog
-import os
+import threading
+import paramiko
+import time
 
-LOG_FILE = "a"
+PI_HOST     = "10.121.63.187"
+PI_USER     = "admin"
+PI_PASSWORD = "1234"
+PI_KEY      = None
+PI_LOG_PATH = "/home/admin/Documents/Moirai/src/KernelSpace/taps.log"
+POLL_SEC    = 2
+
+def fetch_log():
+    try:
+        client = paramiko.SSHClient()
+        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        if PI_KEY:
+            client.connect(PI_HOST, username=PI_USER, key_filename=PI_KEY)
+        else:
+            client.connect(PI_HOST, username=PI_USER, password=PI_PASSWORD)
+        sftp = client.open_sftp()
+        with sftp.open(PI_LOG_PATH, "r") as f:
+            content = f.read().decode("utf-8")
+        sftp.close()
+        client.close()
+        return content
+    except Exception as e:
+        return f"[connection error: {e}]"
 
 class App(tk.Tk):
-	def __init__(self):
-		super().__init__()
+    def _init_(self):
+        super()._init_()
+        self.title("Moirai — NFC Access Log")
+        self.geometry("800x480")
+        self.configure(bg="#ffffff")
+        self.last_content = ""
 
-		self.title("OS Project NFC Scan")
-		self.geometry("800x480")
+    def build_ui(self):
+        tk.Label(
+            self, text="NFC ACCESS LOG",
+            bg="#ffffff", fg="#000000",
+            font=("Monospace", 24, "bold")
+        ).place(x=210, y=30)
 
-		self.configure(bg="#ffffff")
+        tk.Label(
+            self, text=f"Pi: {PI_HOST}  •  {PI_LOG_PATH}",
+            bg="#ffffff", fg="#888888",
+            font=("Monospace", 9)
+        ).place(x=150, y=75)
 
-	def register_uid(self, uid, db):
-		#adding name popup
-		name = simpledialog.askstring(
-			"New Card Detected",
-			f"UID: {uid}\n\nEnter a name for this card (or cancel to skip):"
-		)
-		if name and name.strip():
-			db[uid] = name.strip()
-			save_db(db)
-		return db
+        self.log_box = ScrolledText(
+            self, state="disabled",
+            bg="#111111", fg="#00ff00",
+            font=("Monospace", 10),
+            relief="flat"
+        )
+        self.log_box.place(x=50, y=100, width=700, height=300)
 
-	def build_ui(self):
-		#text box
-		tk.Label(self, text="NFC LOG", bg= "#ffffff", fg="#000000", font=("Monospace", 32)).place(x=275, y=50)
+        self.status = tk.Label(
+            self, text="Connecting...",
+            bg="#ffffff", fg="#888888",
+            font=("Monospace", 9)
+        )
+        self.status.place(x=50, y=415)
 
-		#box with nfc names
-		self.log_box = ScrolledText(self, state="disabled", bg="#111111", fg="#00ff00", font=("Monospace", 10))
-		self.log_box.place(x=150, y=100, width=450, height=150)
-		self.refresh_log()
-		self.start_daemon()
+        self.poll()
 
-	def refresh_log(self):
-		if os.path.exists(LOG_FILE):
-			with open(LOG_FILE, "r") as f:
-				content = f.read()
-			self.log_box.configure(state="normal")
-			self.log_box.delete("1.0", "end")
-			self.log_box.insert("end", content)
-			self.log_box.configure(state = "disabled")
-			self.log_box.see("end") #scrolls to last added name
-		self.after(1000, self.refresh_log) # checks every second
+    def poll(self):
+        threading.Thread(target=self._fetch_and_update, daemon=True).start()
 
-	def start_daemon(self):
-		t = threading.Thread(target=NFC_daemon.main, args=(self.register_uid,), daemon=True)
-		t.start()
+    def _fetch_and_update(self):
+        content = fetch_log()
+        self.after(0, self._update_ui, content)
 
-if __name__ == "__main__":
-	app = App()
-	app.build_ui()
-	app.mainloop()
+    def _update_ui(self, content):
+        if content != self.last_content:
+            self.last_content = content
+            self.log_box.configure(state="normal")
+            self.log_box.delete("1.0", "end")
+            self.log_box.insert("end", content)
+            self.log_box.configure(state="disabled")
+            self.log_box.see("end")
+
+        if "[connection error" in content:
+            self.status.configure(fg="red", text=f"Error — retrying in {POLL_SEC}s")
+        else:
+            self.status.configure(fg="#00aa00", text=f"Connected  •  last updated {time.strftime('%H:%M:%S')}")
+
+        self.after(POLL_SEC * 1000, self.poll)
+
+if _name_ == "_main_":
+    app = App()
+    app.build_ui()
+    app.mainloop()
