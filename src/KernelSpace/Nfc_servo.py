@@ -1,12 +1,4 @@
 #!/usr/bin/env python3
-"""
-nfc_servo.py - PN532 NFC card reader + servo control with authorisation
-Tap an authorised card -> servo unlocks.
-Tap an unauthorised card -> servo stays locked, access denied.
-Unknown card -> prompt to register + set authorisation.
-
-Usage: sudo python3 nfc_servo.py
-"""
 
 import json
 import os
@@ -14,73 +6,37 @@ import time
 import sys
 import signal
 
-# ── NFC config ────────────────────────────────────────────────────────
+if not sys.stdin.isatty():
+    sys.stdin = open("/dev/tty", "r")
+
 PROC_FILE      = "/proc/pn532_uids"
 DB_FILE        = "uids.json"
 LOG_FILE       = "taps.log"
 RETAP_COOLDOWN = 2.0
-
-# ── Servo / PWM config ────────────────────────────────────────────────
-PWM_PATH    = "/sys/class/pwm/pwmchip0"
-PWM0        = f"{PWM_PATH}/pwm0"
-PERIOD_NS   = 20_000_000
-MIN_NS      =    500_000
-MAX_NS      =  2_500_000
-STEP_DELAY  = 0.02
-UNLOCK_HOLD = 2.0
-
-# ── PWM helpers ───────────────────────────────────────────────────────
-def pwm_write(path, value):
-    with open(path, "w") as f:
-        f.write(str(value))
-
-def pwm_setup():
-    try:
-        pwm_write(f"{PWM_PATH}/export", 0)
-        time.sleep(0.1)
-    except OSError:
-        pass
-    pwm_write(f"{PWM0}/period",     PERIOD_NS)
-    pwm_write(f"{PWM0}/duty_cycle", angle_to_ns(0))
-    pwm_write(f"{PWM0}/enable",     1)
-    print("  Servo initialised at 0 degrees")
-
-def pwm_teardown():
-    try:
-        pwm_write(f"{PWM0}/enable", 0)
-        pwm_write(f"{PWM_PATH}/unexport", 0)
-    except OSError:
-        pass
-    print("  Servo PWM cleaned up")
-
-def angle_to_ns(angle):
-    return int(MIN_NS + (angle / 180.0) * (MAX_NS - MIN_NS))
+SERVO_DEV      = "/dev/servo"
+UNLOCK_HOLD    = 2.0
 
 def servo_set(angle):
-    pwm_write(f"{PWM0}/duty_cycle", angle_to_ns(angle))
-
-def servo_sweep(start, end, step=2):
-    angles = range(start, end + 1, step) if start <= end \
-             else range(start, end - 1, -step)
-    for angle in angles:
-        servo_set(angle)
-        time.sleep(STEP_DELAY)
+    with open(SERVO_DEV, "w") as f:
+        f.write(f"{angle}\n")
 
 def servo_unlock():
     print("  Servo: UNLOCKING")
-    servo_sweep(0, 180, step=2)
+    with open(SERVO_DEV, "w") as f:
+        f.write("sweep 0 180 2 20\n")
     time.sleep(UNLOCK_HOLD)
     print("  Servo: LOCKING")
-    servo_sweep(180, 0, step=2)
+    with open(SERVO_DEV, "w") as f:
+        f.write("sweep 180 0 2 20\n")
 
 def servo_deny():
-    """Small jiggle to indicate denial."""
     print("  Servo: ACCESS DENIED")
-    servo_sweep(0, 20, step=2)
+    with open(SERVO_DEV, "w") as f:
+        f.write("sweep 0 20 2 20\n")
     time.sleep(0.2)
-    servo_sweep(20, 0, step=2)
+    with open(SERVO_DEV, "w") as f:
+        f.write("sweep 20 0 2 20\n")
 
-# ── NFC / DB helpers ──────────────────────────────────────────────────
 def load_db():
     if os.path.exists(DB_FILE):
         with open(DB_FILE, "r") as f:
@@ -140,18 +96,13 @@ def register_uid(uid, db):
         return db
 
     authorised = auth_input == "y"
-
-    db[uid] = {
-        "name":       name,
-        "authorised": authorised
-    }
+    db[uid] = {"name": name, "authorised": authorised}
     save_db(db)
 
     status = "AUTHORISED" if authorised else "UNAUTHORISED"
     print(f"  Saved: {uid} -> {name} [{status}]")
     return db
 
-# ── Main ──────────────────────────────────────────────────────────────
 def main():
     print("=" * 55)
     print("  NFC Servo Controller")
@@ -162,11 +113,8 @@ def main():
     print("  Ctrl+C to exit")
     print("=" * 55)
 
-    pwm_setup()
-
     db = load_db()
 
-    # Handle old-format DB entries (just strings, no authorised field)
     migrated = False
     for uid, val in db.items():
         if isinstance(val, str):
@@ -176,7 +124,6 @@ def main():
         save_db(db)
         print("  Migrated old DB entries to new format.")
 
-    # Print current registered cards
     print(f"\n  Registered cards ({len(db)}):")
     for uid, info in db.items():
         status = "AUTHORISED" if info["authorised"] else "UNAUTHORISED"
@@ -193,7 +140,6 @@ def main():
 
     def handle_exit(sig, frame):
         print("\n  Shutting down...")
-        pwm_teardown()
         sys.exit(0)
     signal.signal(signal.SIGINT, handle_exit)
 
@@ -215,14 +161,13 @@ def main():
                 authorised = info["authorised"]
 
                 if authorised:
-                    print(f"\n[TAP] ✓ AUTHORISED — {name} ({uid})")
+                    print(f"\n[TAP] AUTHORISED — {name} ({uid})")
                     log_tap(uid, name, True, timestamp)
                     servo_unlock()
                 else:
-                    print(f"\n[TAP] ✗ DENIED — {name} ({uid})")
+                    print(f"\n[TAP] DENIED — {name} ({uid})")
                     log_tap(uid, name, False, timestamp)
                     servo_deny()
-
             else:
                 db   = register_uid(uid, db)
                 info = db.get(uid)

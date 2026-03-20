@@ -11,19 +11,21 @@
 #include <linux/delay.h>
 #include <linux/proc_fs.h>
 #include <linux/seq_file.h>
-#include <linux/pwm.h>
-#include <linux/platform_device.h>
+#include <linux/kmod.h>
+#include <linux/slab.h>
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("OS Project Team");
-MODULE_DESCRIPTION("Micro Servo Driver for Raspberry Pi 4 via Kernel PWM API");
-MODULE_VERSION("5.0");
+MODULE_DESCRIPTION("Micro Servo Driver for Raspberry Pi 4");
+MODULE_VERSION("7.1");
 
-#define PWM_PERIOD_NS       20000000
-#define SERVO_MIN_NS         1000000
-#define SERVO_MAX_NS         2000000
 #define SERVO_MIN_ANGLE      0
 #define SERVO_MAX_ANGLE      180
+#define PWM_PERIOD_NS        20000000
+#define SERVO_MIN_NS         500000
+#define SERVO_MAX_NS         2500000
+
+#define PWM_DUTY_PATH "/sys/class/pwm/pwmchip0/pwm0/duty_cycle"
 
 #define SERVO_IOC_MAGIC     'S'
 #define SERVO_IOCTL_SET_ANGLE   _IOW(SERVO_IOC_MAGIC, 1, int)
@@ -42,7 +44,6 @@ static dev_t             servo_dev;
 static struct cdev       servo_cdev;
 static struct class     *servo_class;
 static struct device    *servo_device;
-static struct pwm_device *servo_pwm;
 
 static DEFINE_MUTEX(servo_mutex);
 static int current_angle = 90;
@@ -63,24 +64,30 @@ static int angle_to_ns(int angle)
            (angle * (SERVO_MAX_NS - SERVO_MIN_NS)) / SERVO_MAX_ANGLE;
 }
 
-static int pwm_set_angle(int angle)
+static int pwm_write_sysfs(int duty_ns)
 {
+    char *cmd;
+    char *argv[4];
+    char *envp[] = {
+        "HOME=/root",
+        "PATH=/sbin:/bin:/usr/bin",
+        NULL
+    };
     int ret;
-    int duty_ns = angle_to_ns(angle);
 
-    ret = pwm_config(servo_pwm, duty_ns, PWM_PERIOD_NS);
-    if (ret) {
-        pr_err("servo_driver: pwm_config failed (%d)\n", ret);
-        return ret;
-    }
+    cmd = kasprintf(GFP_KERNEL,
+                    "echo %d > " PWM_DUTY_PATH, duty_ns);
+    if (!cmd)
+        return -ENOMEM;
 
-    ret = pwm_enable(servo_pwm);
-    if (ret) {
-        pr_err("servo_driver: pwm_enable failed (%d)\n", ret);
-        return ret;
-    }
+    argv[0] = "/bin/sh";
+    argv[1] = "-c";
+    argv[2] = cmd;
+    argv[3] = NULL;
 
-    return 0;
+    ret = call_usermodehelper("/bin/sh", argv, envp, UMH_WAIT_PROC);
+    kfree(cmd);
+    return ret;
 }
 
 static int servo_set_angle_locked(int angle)
@@ -93,14 +100,16 @@ static int servo_set_angle_locked(int angle)
         return -EINVAL;
     }
 
-    ret = pwm_set_angle(angle);
+    ret = pwm_write_sysfs(angle_to_ns(angle));
     if (ret) {
+        pr_err("servo_driver: pwm_write_sysfs failed (%d)\n", ret);
         error_count++;
         return ret;
     }
 
     current_angle = angle;
     angle_changed = 1;
+    pr_info("servo_driver: angle set to %d\n", angle);
     wake_up_interruptible(&servo_wq);
     return 0;
 }
@@ -274,14 +283,13 @@ static int proc_show(struct seq_file *m, void *v)
 {
     mutex_lock(&servo_mutex);
     seq_printf(m, "=== Servo Driver Statistics ===\n");
-    seq_printf(m, "Current Angle  : %d degrees\n",   current_angle);
+    seq_printf(m, "Current Angle  : %d degrees\n", current_angle);
     seq_printf(m, "Duty Cycle     : %d ns / %d ns\n",
                angle_to_ns(current_angle), PWM_PERIOD_NS);
     seq_printf(m, "Total Writes   : %lu\n", total_writes);
     seq_printf(m, "Total Reads    : %lu\n", total_reads);
     seq_printf(m, "Total Sweeps   : %lu\n", total_sweeps);
     seq_printf(m, "Error Count    : %lu\n", error_count);
-    seq_printf(m, "PWM Frequency  : 50 Hz\n");
     seq_printf(m, "GPIO Pin       : 18\n");
     mutex_unlock(&servo_mutex);
     return 0;
@@ -299,64 +307,28 @@ static const struct proc_ops servo_proc_ops = {
     .proc_release = single_release,
 };
 
-static struct pwm_device *servo_acquire_pwm(void)
+static int pwm_sysfs_setup(void)
 {
-    struct device   *dev;
-    struct pwm_chip *chip;
-
-    dev = bus_find_device_by_name(&platform_bus_type, NULL, "fe20c000.pwm");
-    if (!dev) {
-        pr_err("servo_driver: fe20c000.pwm not found on platform bus\n");
-        return ERR_PTR(-ENODEV);
-    }
-
-    chip = dev_get_drvdata(dev);
-    put_device(dev);
-
-    if (!chip) {
-        pr_err("servo_driver: no pwm_chip in drvdata\n");
-        return ERR_PTR(-ENODEV);
-    }
-
-    pr_info("servo_driver: found PWM chip with %u channel(s)\n", chip->npwm);
-
-    if (chip->npwm < 1) {
-        pr_err("servo_driver: PWM chip has no channels\n");
-        return ERR_PTR(-ENODEV);
-    }
-
-    return &chip->pwms[0];
+    char *envp[] = { "HOME=/root", "PATH=/sbin:/bin:/usr/bin", NULL };
+    char *export_argv[] = { "/bin/sh", "-c",
+        "echo 0 > /sys/class/pwm/pwmchip0/export 2>/dev/null; "
+        "sleep 0.1; "
+        "echo 20000000 > /sys/class/pwm/pwmchip0/pwm0/period; "
+        "echo 1 > /sys/class/pwm/pwmchip0/pwm0/enable",
+        NULL };
+    return call_usermodehelper("/bin/sh", export_argv, envp, UMH_WAIT_PROC);
 }
 
 static int __init servo_init(void)
 {
     int ret;
 
-    servo_pwm = servo_acquire_pwm();
-    if (IS_ERR(servo_pwm)) {
-        pr_err("servo_driver: failed to acquire PWM (%ld)\n",
-               PTR_ERR(servo_pwm));
-        return PTR_ERR(servo_pwm);
-    }
-
-    ret = pwm_config(servo_pwm, angle_to_ns(current_angle), PWM_PERIOD_NS);
-    if (ret) {
-        pr_err("servo_driver: pwm_config failed (%d)\n", ret);
-        return ret;
-    }
-
-    ret = pwm_enable(servo_pwm);
-    if (ret) {
-        pr_err("servo_driver: pwm_enable failed (%d)\n", ret);
-        return ret;
-    }
-
-    pr_info("servo_driver: PWM enabled, servo centred at 90 degrees\n");
+    pwm_sysfs_setup();
 
     ret = alloc_chrdev_region(&servo_dev, 0, 1, "servo");
     if (ret) {
         pr_err("servo_driver: alloc_chrdev_region failed (%d)\n", ret);
-        goto err_pwm;
+        return ret;
     }
 
     cdev_init(&servo_cdev, &servo_fops);
@@ -393,8 +365,6 @@ err_cdev:
     cdev_del(&servo_cdev);
 err_region:
     unregister_chrdev_region(servo_dev, 1);
-err_pwm:
-    pwm_disable(servo_pwm);
     return ret;
 }
 
@@ -407,9 +377,6 @@ static void __exit servo_exit(void)
     class_destroy(servo_class);
     cdev_del(&servo_cdev);
     unregister_chrdev_region(servo_dev, 1);
-
-    if (servo_pwm)
-        pwm_disable(servo_pwm);
 
     pr_info("servo_driver: unloaded\n");
 }

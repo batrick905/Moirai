@@ -1,0 +1,10 @@
+{
+  "04:51:4A:B2:61:13:90": {
+    "name": "Patrick",
+    "authorised": true
+  },
+  "04:5B:18:62:39:79:80": {
+    "name": "John",
+    "authorised": false
+  }
+}
